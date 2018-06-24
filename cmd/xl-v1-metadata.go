@@ -18,9 +18,9 @@ package cmd
 
 import (
 	"context"
-	"crypto"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"path"
@@ -36,43 +36,23 @@ import (
 
 const erasureAlgorithmKlauspost = "klauspost/reedsolomon/vandermonde"
 
-// DefaultBitrotAlgorithm is the default algorithm used for bitrot protection.
-var DefaultBitrotAlgorithm = HighwayHash256
-
-func init() {
-	hh256Key, err := hex.DecodeString(magicHighwayHash256Key)
-	if err != nil || len(hh256Key) != highwayhash.Size {
-		panic("Failed to decode fixed magic HighwayHash256 key: Please report this bug at https://github.com/minio/minio/issues")
-	}
-
-	newBLAKE2b := func() hash.Hash {
-		b2, _ := blake2b.New512(nil) // New512 never returns an error if the key is nil
-		return b2
-	}
-	newHighwayHash256 := func() hash.Hash {
-		hh, _ := highwayhash.New(hh256Key) // New will never return error since key is 256 bit
-		return hh
-	}
-
-	crypto.RegisterHash(crypto.Hash(SHA256), sha256.New)
-	crypto.RegisterHash(crypto.Hash(BLAKE2b512), newBLAKE2b)
-	crypto.RegisterHash(crypto.Hash(HighwayHash256), newHighwayHash256)
-}
+// magic HH-256 key as HH-256 hash of the first 100 decimals of π as utf-8 string with a zero key.
+var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
 
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.
-type BitrotAlgorithm crypto.Hash
+type BitrotAlgorithm uint
 
 const (
 	// SHA256 represents the SHA-256 hash function
-	SHA256 = BitrotAlgorithm(crypto.SHA256)
-
+	SHA256 BitrotAlgorithm = 1 + iota
 	// HighwayHash256 represents the HighwayHash-256 hash function
-	HighwayHash256         = BitrotAlgorithm(crypto.SHA3_256)                                   // we must define that HighwayHash-256 is SHA3-256 because there is no HighwayHash constant in golang/crypto yet.
-	magicHighwayHash256Key = "4be734fa8e238acd263e83e6bb968552040f935da39f441497e09d1322de36a0" // magic HH-256 key as HH-256 hash of the first 100 decimals of π as utf-8 string with a zero key.
-
+	HighwayHash256
 	// BLAKE2b512 represents the BLAKE2b-256 hash function
-	BLAKE2b512 = BitrotAlgorithm(crypto.BLAKE2b_512)
+	BLAKE2b512
 )
+
+// DefaultBitrotAlgorithm is the default algorithm used for bitrot protection.
+var DefaultBitrotAlgorithm = HighwayHash256
 
 var bitrotAlgorithms = map[BitrotAlgorithm]string{
 	SHA256:         "sha256",
@@ -80,28 +60,38 @@ var bitrotAlgorithms = map[BitrotAlgorithm]string{
 	HighwayHash256: "highwayhash256",
 }
 
-// New returns a new hash.Hash calculating the given bitrot algorithm. New panics
-// if the algorithm is not supported or not linked into the binary.
+// New returns a new hash.Hash calculating the given bitrot algorithm.
+// New logs error and exits if the algorithm is not supported or not
+// linked into the binary.
 func (a BitrotAlgorithm) New() hash.Hash {
-	if _, ok := bitrotAlgorithms[a]; !ok {
-		panic(fmt.Sprintf("bitrot algorithm #%d is not supported", a))
+	switch a {
+	case SHA256:
+		return sha256.New()
+	case BLAKE2b512:
+		b2, _ := blake2b.New512(nil) // New512 never returns an error if the key is nil
+		return b2
+	case HighwayHash256:
+		hh, _ := highwayhash.New(magicHighwayHash256Key) // New will never return error since key is 256 bit
+		return hh
 	}
-	return crypto.Hash(a).New()
+	logger.CriticalIf(context.Background(), errors.New("Unsupported bitrot algorithm"))
+	return nil
 }
 
 // Available reports whether the given algorihm is a supported and linked into the binary.
 func (a BitrotAlgorithm) Available() bool {
 	_, ok := bitrotAlgorithms[a]
-	return ok && crypto.Hash(a).Available()
+	return ok
 }
 
 // String returns the string identifier for a given bitrot algorithm.
 // If the algorithm is not supported String panics.
 func (a BitrotAlgorithm) String() string {
-	if name, ok := bitrotAlgorithms[a]; ok {
-		return name
+	name, ok := bitrotAlgorithms[a]
+	if !ok {
+		logger.CriticalIf(context.Background(), errors.New("Unsupported bitrot algorithm"))
 	}
-	panic(fmt.Sprintf("bitrot algorithm #%d is not supported", a))
+	return name
 }
 
 // BitrotAlgorithmFromString returns a bitrot algorithm from the given string representation.
@@ -384,8 +374,7 @@ func (m xlMetaV1) ObjectToPartOffset(ctx context.Context, offset int64) (partInd
 }
 
 // pickValidXLMeta - picks one valid xlMeta content and returns from a
-// slice of xlmeta content. If no value is found this function panics
-// and dies.
+// slice of xlmeta content.
 func pickValidXLMeta(ctx context.Context, metaArr []xlMetaV1, modTime time.Time) (xmv xlMetaV1, e error) {
 	// Pick latest valid metadata.
 	for _, meta := range metaArr {

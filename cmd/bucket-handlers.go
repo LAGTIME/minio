@@ -20,90 +20,69 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 
-	mux "github.com/gorilla/mux"
-	"github.com/minio/minio-go/pkg/policy"
-	"github.com/minio/minio-go/pkg/set"
+	etcd "github.com/coreos/etcd/client"
+
+	"github.com/gorilla/mux"
+
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/dns"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/sync/errgroup"
+
+	"github.com/minio/minio-go/pkg/set"
 )
 
-// http://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
-// Enforces bucket policies for a bucket for a given tatusaction.
-func enforceBucketPolicy(ctx context.Context, bucket, action, resource, referer, sourceIP string, queryParams url.Values) (s3Error APIErrorCode) {
-	// Verify if bucket actually exists
-	objAPI := newObjectLayerFn()
-	if err := checkBucketExist(ctx, bucket, objAPI); err != nil {
-		switch err.(type) {
-		case BucketNameInvalid:
-			// Return error for invalid bucket name.
-			return ErrInvalidBucketName
-		case BucketNotFound:
-			// For no bucket found we return NoSuchBucket instead.
-			return ErrNoSuchBucket
+// Check if there are buckets on server without corresponding entry in etcd backend and
+// make entries. Here is the general flow
+// - Range over all the available buckets
+// - Check if a bucket has an entry in etcd backend
+// -- If no, make an entry
+// -- If yes, check if the IP of entry matches local IP. This means entry is for this instance.
+// -- If IP of the entry doesn't match, this means entry is for another instance. Log an error to console.
+func initFederatorBackend(objLayer ObjectLayer) {
+	b, err := objLayer.ListBuckets(context.Background())
+	if err != nil {
+		logger.LogIf(context.Background(), err)
+		return
+	}
+
+	g := errgroup.WithNErrs(len(b))
+	for index := range b {
+		index := index
+		g.Go(func() error {
+			r, gerr := globalDNSConfig.Get(b[index].Name)
+			if gerr != nil {
+				if etcd.IsKeyNotFound(gerr) || gerr == dns.ErrNoEntriesFound {
+					return globalDNSConfig.Put(b[index].Name)
+				}
+				return gerr
+			}
+			if globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(r)...)).IsEmpty() {
+				// There is already an entry for this bucket, with all IP addresses different. This indicates a bucket name collision. Log an error and continue.
+				return fmt.Errorf("Unable to add bucket DNS entry for bucket %s, an entry exists for the same bucket. Use one of these IP addresses %v to access the bucket", b[index].Name, globalDomainIPs.ToSlice())
+			}
+			return nil
+		}, index)
+	}
+
+	for _, err := range g.Wait() {
+		if err != nil {
+			logger.LogIf(context.Background(), err)
+			return
 		}
-		// Return internal error for any other errors so that we can investigate.
-		return ErrInternalError
 	}
-
-	// Fetch bucket policy, if policy is not set return access denied.
-	p, err := objAPI.GetBucketPolicy(ctx, bucket)
-	if err != nil {
-		return ErrAccessDenied
-	}
-	if reflect.DeepEqual(p, emptyBucketPolicy) {
-		return ErrAccessDenied
-	}
-
-	// Construct resource in 'arn:aws:s3:::examplebucket/object' format.
-	arn := bucketARNPrefix + strings.TrimSuffix(strings.TrimPrefix(resource, "/"), "/")
-
-	// Get conditions for policy verification.
-	conditionKeyMap := make(policy.ConditionKeyMap)
-	for queryParam := range queryParams {
-		conditionKeyMap[queryParam] = set.CreateStringSet(queryParams.Get(queryParam))
-	}
-
-	// Add request referer to conditionKeyMap if present.
-	if referer != "" {
-		conditionKeyMap["referer"] = set.CreateStringSet(referer)
-	}
-	// Add request source Ip to conditionKeyMap.
-	conditionKeyMap["ip"] = set.CreateStringSet(sourceIP)
-
-	// Validate action, resource and conditions with current policy statements.
-	if !bucketPolicyEvalStatements(action, arn, conditionKeyMap, p.Statements) {
-		return ErrAccessDenied
-	}
-	return ErrNone
-}
-
-// Check if the action is allowed on the bucket/prefix.
-func isBucketActionAllowed(action, bucket, prefix string, objectAPI ObjectLayer) bool {
-	reqInfo := &logger.ReqInfo{BucketName: bucket}
-	reqInfo.AppendTags("prefix", prefix)
-	ctx := logger.SetReqInfo(context.Background(), reqInfo)
-	bp, err := objectAPI.GetBucketPolicy(ctx, bucket)
-	if err != nil {
-		return false
-	}
-	if reflect.DeepEqual(bp, emptyBucketPolicy) {
-		return false
-	}
-	resource := bucketARNPrefix + path.Join(bucket, prefix)
-	var conditionKeyMap map[string]set.StringSet
-	// Validate action, resource and conditions with current policy statements.
-	return bucketPolicyEvalStatements(action, resource, conditionKeyMap, bp.Statements)
 }
 
 // GetBucketLocationHandler - GET Bucket location.
@@ -121,12 +100,7 @@ func (api objectAPIHandlers) GetBucketLocationHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	s3Error := checkRequestAuthType(ctx, r, bucket, "s3:GetBucketLocation", globalMinioDefaultRegion)
-	if s3Error == ErrInvalidRegion {
-		// Clients like boto3 send getBucketLocation() call signed with region that is configured.
-		s3Error = checkRequestAuthType(ctx, r, "", "s3:GetBucketLocation", globalServerConfig.GetRegion())
-	}
-	if s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketLocationAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -180,7 +154,7 @@ func (api objectAPIHandlers) ListMultipartUploadsHandler(w http.ResponseWriter, 
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:ListBucketMultipartUploads", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketMultipartUploadsAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -228,21 +202,38 @@ func (api objectAPIHandlers) ListBucketsHandler(w http.ResponseWriter, r *http.R
 	if api.CacheAPI() != nil {
 		listBuckets = api.CacheAPI().ListBuckets
 	}
-	// ListBuckets does not have any bucket action.
-	s3Error := checkRequestAuthType(ctx, r, "", "", globalMinioDefaultRegion)
-	if s3Error == ErrInvalidRegion {
-		// Clients like boto3 send listBuckets() call signed with region that is configured.
-		s3Error = checkRequestAuthType(ctx, r, "", "", globalServerConfig.GetRegion())
-	}
-	if s3Error != ErrNone {
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListAllMyBucketsAction, "", ""); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
-	// Invoke the list buckets.
-	bucketsInfo, err := listBuckets(ctx)
-	if err != nil {
-		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
-		return
+	// If etcd, dns federation configured list buckets from etcd.
+	var bucketsInfo []BucketInfo
+	if globalDNSConfig != nil {
+		dnsBuckets, err := globalDNSConfig.List()
+		if err != nil && !etcd.IsKeyNotFound(err) && err != dns.ErrNoEntriesFound {
+			writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+			return
+		}
+		bucketSet := set.NewStringSet()
+		for _, dnsRecord := range dnsBuckets {
+			if bucketSet.Contains(dnsRecord.Key) {
+				continue
+			}
+			bucketsInfo = append(bucketsInfo, BucketInfo{
+				Name:    strings.Trim(dnsRecord.Key, slashSeparator),
+				Created: dnsRecord.CreationDate,
+			})
+			bucketSet.Add(dnsRecord.Key)
+		}
+	} else {
+		// Invoke the list buckets.
+		var err error
+		bucketsInfo, err = listBuckets(ctx)
+		if err != nil {
+			writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+			return
+		}
 	}
 
 	// Generate response.
@@ -266,12 +257,12 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		return
 	}
 
-	var authError APIErrorCode
-	if authError = checkRequestAuthType(ctx, r, bucket, "s3:DeleteObject", globalServerConfig.GetRegion()); authError != ErrNone {
+	var s3Error APIErrorCode
+	if s3Error = checkRequestAuthType(ctx, r, policy.DeleteObjectAction, bucket, ""); s3Error != ErrNone {
 		// In the event access is denied, a 200 response should still be returned
 		// http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
-		if authError != ErrAccessDenied {
-			writeErrorResponse(w, authError, r.URL)
+		if s3Error != ErrAccessDenied {
+			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
 	}
@@ -291,7 +282,13 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	}
 
 	// Allocate incoming content length bytes.
-	deleteXMLBytes := make([]byte, r.ContentLength)
+	var deleteXMLBytes []byte
+	const maxBodySize = 2 * 1000 * 1024 // The max. XML contains 1000 object names (each at most 1024 bytes long) + XML overhead
+	if r.ContentLength > maxBodySize {  // Only allocated memory for at most 1000 objects
+		deleteXMLBytes = make([]byte, maxBodySize)
+	} else {
+		deleteXMLBytes = make([]byte, r.ContentLength)
+	}
 
 	// Read incoming body XML bytes.
 	if _, err := io.ReadFull(r.Body, deleteXMLBytes); err != nil {
@@ -326,7 +323,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			defer wg.Done()
 			// If the request is denied access, each item
 			// should be marked as 'AccessDenied'
-			if authError == ErrAccessDenied {
+			if s3Error == ErrAccessDenied {
 				dErrs[i] = PrefixAccessDenied{
 					Bucket: bucket,
 					Object: obj.ObjectName,
@@ -411,15 +408,13 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// PutBucket does not have any bucket action.
-	s3Error := checkRequestAuthType(ctx, r, "", "", globalServerConfig.GetRegion())
-	if s3Error != ErrNone {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.CreateBucketAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
-
-	vars := mux.Vars(r)
-	bucket := vars["bucket"]
 
 	// Parse incoming location constraint.
 	location, s3Error := parseLocationConstraint(r)
@@ -435,12 +430,33 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	bucketLock := globalNSMutex.NewNSLock(bucket, "")
-	if err := bucketLock.GetLock(globalObjectTimeout); err != nil {
-		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+	if globalDNSConfig != nil {
+		if _, err := globalDNSConfig.Get(bucket); err != nil {
+			if etcd.IsKeyNotFound(err) || err == dns.ErrNoEntriesFound {
+				// Proceed to creating a bucket.
+				if err = objectAPI.MakeBucketWithLocation(ctx, bucket, location); err != nil {
+					writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+					return
+				}
+				if err = globalDNSConfig.Put(bucket); err != nil {
+					objectAPI.DeleteBucket(ctx, bucket)
+					writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+					return
+				}
+
+				// Make sure to add Location information here only for bucket
+				w.Header().Set("Location", getObjectLocation(r, globalDomainName, bucket, ""))
+
+				writeSuccessResponseHeadersOnly(w)
+				return
+			}
+			writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+			return
+
+		}
+		writeErrorResponse(w, ErrBucketAlreadyOwnedByYou, r.URL)
 		return
 	}
-	defer bucketLock.Unlock()
 
 	// Proceed to creating a bucket.
 	err := objectAPI.MakeBucketWithLocation(ctx, bucket, location)
@@ -690,10 +706,11 @@ func (api objectAPIHandlers) HeadBucketHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:ListBucket", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponseHeadersOnly(w, s3Error)
 		return
 	}
+
 	getBucketInfo := objectAPI.GetBucketInfo
 	if api.CacheAPI() != nil {
 		getBucketInfo = api.CacheAPI().GetBucketInfo
@@ -710,20 +727,20 @@ func (api objectAPIHandlers) HeadBucketHandler(w http.ResponseWriter, r *http.Re
 func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, "DeleteBucket")
 
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
 		writeErrorResponse(w, ErrServerNotInitialized, r.URL)
 		return
 	}
 
-	// DeleteBucket does not have any bucket action.
-	if s3Error := checkRequestAuthType(ctx, r, "", "", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.DeleteBucketAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
 
-	vars := mux.Vars(r)
-	bucket := vars["bucket"]
 	deleteBucket := objectAPI.DeleteBucket
 	if api.CacheAPI() != nil {
 		deleteBucket = api.CacheAPI().DeleteBucket
@@ -734,16 +751,20 @@ func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Notify all peers (including self) to update in-memory state
-	for addr, err := range globalNotificationSys.UpdateBucketPolicy(bucket) {
-		logger.GetReqInfo(ctx).AppendTags("remotePeer", addr.Name)
-		logger.LogIf(ctx, err)
+	globalNotificationSys.RemoveNotification(bucket)
+	globalPolicySys.Remove(bucket)
+	for nerr := range globalNotificationSys.DeleteBucket(bucket) {
+		logger.GetReqInfo(ctx).AppendTags("remotePeer", nerr.Host.Name)
+		logger.LogIf(ctx, nerr.Err)
 	}
 
-	globalNotificationSys.RemoveNotification(bucket)
-	for addr, err := range globalNotificationSys.DeleteBucket(bucket) {
-		logger.GetReqInfo(ctx).AppendTags("remotePeer", addr.Name)
-		logger.LogIf(ctx, err)
+	if globalDNSConfig != nil {
+		if err := globalDNSConfig.Delete(bucket); err != nil {
+			// Deleting DNS entry failed, attempt to create the bucket again.
+			objectAPI.MakeBucketWithLocation(ctx, bucket, "")
+			writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+			return
+		}
 	}
 
 	// Write success response.

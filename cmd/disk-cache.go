@@ -77,6 +77,13 @@ type cacheObjects struct {
 	DeleteBucketFn            func(ctx context.Context, bucket string) error
 }
 
+// CacheStorageInfo - represents total, free capacity of
+// underlying cache storage.
+type CacheStorageInfo struct {
+	Total uint64 // Total cache disk space.
+	Free  uint64 // Free cache available space.
+}
+
 // CacheObjectLayer implements primitives for cache object API layer.
 type CacheObjectLayer interface {
 	// Bucket operations.
@@ -98,7 +105,7 @@ type CacheObjectLayer interface {
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart) (objInfo ObjectInfo, err error)
 
 	// Storage operations.
-	StorageInfo(ctx context.Context) StorageInfo
+	StorageInfo(ctx context.Context) CacheStorageInfo
 }
 
 // backendDownError returns true if err is due to backend failure or faulty disk if in server mode
@@ -289,12 +296,20 @@ func listDirCacheFactory(isLeaf isLeafFunc, treeWalkIgnoredErrs []error, disks [
 	listCacheDirs := func(bucket, prefixDir, prefixEntry string) (dirs []string, err error) {
 		var entries []string
 		for _, disk := range disks {
+			// ignore disk-caches that might be missing/offline
+			if disk == nil {
+				continue
+			}
 			fs := disk.FSObjects
 			entries, err = readDir(pathJoin(fs.fsPath, bucket, prefixDir))
+
+			// For any reason disk was deleted or goes offline, continue
+			// and list from other disks if possible.
 			if err != nil {
-				// For any reason disk was deleted or goes offline, continue
-				// and list from other disks if possible.
-				continue
+				if IsErrIgnored(err, treeWalkIgnoredErrs...) {
+					continue
+				}
+				return nil, err
 			}
 
 			// Filter entries that have the prefix prefixEntry.
@@ -349,8 +364,16 @@ func (c cacheObjects) listCacheObjects(ctx context.Context, bucket, prefix, mark
 			return err == nil
 		}
 
+		isLeafDir := func(bucket, object string) bool {
+			fs, err := c.cache.getCacheFS(ctx, bucket, object)
+			if err != nil {
+				return false
+			}
+			return fs.isObjectDir(bucket, object)
+		}
+
 		listDir := listDirCacheFactory(isLeaf, cacheTreeWalkIgnoredErrs, c.cache.cfs)
-		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, endWalkCh)
+		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 	}
 
 	for i := 0; i < maxKeys; {
@@ -377,16 +400,16 @@ func (c cacheObjects) listCacheObjects(ctx context.Context, bucket, prefix, mark
 			var err error
 			fs, err := c.cache.getCacheFS(ctx, bucket, entry)
 			if err != nil {
-				// Ignore errFileNotFound
-				if err == errFileNotFound {
+				// Ignore errDiskNotFound
+				if err == errDiskNotFound {
 					continue
 				}
 				return result, toObjectErr(err, bucket, prefix)
 			}
 			objInfo, err = fs.getObjectInfo(ctx, bucket, entry)
 			if err != nil {
-				// Ignore errFileNotFound
-				if err == errFileNotFound {
+				// Ignore ObjectNotFound error
+				if _, ok := err.(ObjectNotFound); ok {
 					continue
 				}
 				return result, toObjectErr(err, bucket, prefix)
@@ -409,7 +432,7 @@ func (c cacheObjects) listCacheObjects(ctx context.Context, bucket, prefix, mark
 	result = ListObjectsInfo{IsTruncated: !eof}
 	for _, objInfo := range objInfos {
 		result.NextMarker = objInfo.Name
-		if objInfo.IsDir {
+		if objInfo.IsDir && delimiter == slashSeparator {
 			result.Prefixes = append(result.Prefixes, objInfo.Name)
 			continue
 		}
@@ -469,6 +492,10 @@ func (c cacheObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continu
 func (c cacheObjects) listBuckets(ctx context.Context) (buckets []BucketInfo, err error) {
 	m := make(map[string]string)
 	for _, cache := range c.cache.cfs {
+		// ignore disk-caches that might be missing/offline
+		if cache == nil {
+			continue
+		}
 		entries, err := cache.ListBuckets(ctx)
 
 		if err != nil {
@@ -507,6 +534,10 @@ func (c cacheObjects) GetBucketInfo(ctx context.Context, bucket string) (bucketI
 	bucketInfo, err = getBucketInfoFn(ctx, bucket)
 	if backendDownError(err) {
 		for _, cache := range c.cache.cfs {
+			// ignore disk-caches that might be missing/offline
+			if cache == nil {
+				continue
+			}
 			if bucketInfo, err = cache.GetBucketInfo(ctx, bucket); err == nil {
 				return
 			}
@@ -747,24 +778,22 @@ func (c cacheObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 }
 
 // StorageInfo - returns underlying storage statistics.
-func (c cacheObjects) StorageInfo(ctx context.Context) (storageInfo StorageInfo) {
+func (c cacheObjects) StorageInfo(ctx context.Context) (cInfo CacheStorageInfo) {
 	var total, free uint64
 	for _, cfs := range c.cache.cfs {
 		if cfs == nil {
 			continue
 		}
-		info, err := getDiskInfo((cfs.fsPath))
+		info, err := getDiskInfo(cfs.fsPath)
 		logger.GetReqInfo(ctx).AppendTags("cachePath", cfs.fsPath)
 		logger.LogIf(ctx, err)
 		total += info.Total
 		free += info.Free
 	}
-	storageInfo = StorageInfo{
+	return CacheStorageInfo{
 		Total: total,
 		Free:  free,
 	}
-	storageInfo.Backend.Type = FS
-	return storageInfo
 }
 
 // DeleteBucket - marks bucket to be deleted from cache if bucket is deleted from backend.
@@ -772,6 +801,10 @@ func (c cacheObjects) DeleteBucket(ctx context.Context, bucket string) (err erro
 	deleteBucketFn := c.DeleteBucketFn
 	var toDel []*cacheFSObjects
 	for _, cfs := range c.cache.cfs {
+		// ignore disk-caches that might be missing/offline
+		if cfs == nil {
+			continue
+		}
 		if _, cerr := cfs.GetBucketInfo(ctx, bucket); cerr == nil {
 			toDel = append(toDel, cfs)
 		}

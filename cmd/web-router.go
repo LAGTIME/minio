@@ -23,7 +23,7 @@ import (
 
 	"github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/handlers"
-	router "github.com/gorilla/mux"
+	"github.com/gorilla/mux"
 	jsonrpc "github.com/gorilla/rpc/v2"
 	"github.com/gorilla/rpc/v2/json2"
 	"github.com/minio/minio/browser"
@@ -60,7 +60,7 @@ func assetFS() *assetfs.AssetFS {
 const specialAssets = ".*index_bundle.*.js$|.*loader.css$|.*logo.svg$|.*firefox.png$|.*safari.png$|.*chrome.png$|.*favicon.ico$"
 
 // registerWebRouter - registers web router for serving minio browser.
-func registerWebRouter(mux *router.Router) error {
+func registerWebRouter(router *mux.Router) error {
 	// Initialize Web.
 	web := &webAPIHandlers{
 		ObjectAPI: newObjectLayerFn,
@@ -71,7 +71,7 @@ func registerWebRouter(mux *router.Router) error {
 	codec := json2.NewCodec()
 
 	// Minio browser router.
-	webBrowserRouter := mux.NewRoute().PathPrefix(minioReservedBucketPath).Subrouter()
+	webBrowserRouter := router.PathPrefix(minioReservedBucketPath).Subrouter()
 
 	// Initialize json rpc handlers.
 	webRPC := jsonrpc.NewServer()
@@ -85,12 +85,12 @@ func registerWebRouter(mux *router.Router) error {
 
 	// RPC handler at URI - /minio/webrpc
 	webBrowserRouter.Methods("POST").Path("/webrpc").Handler(webRPC)
-	webBrowserRouter.Methods("PUT").Path("/upload/{bucket}/{object:.+}").HandlerFunc(web.Upload)
+	webBrowserRouter.Methods("PUT").Path("/upload/{bucket}/{object:.+}").HandlerFunc(httpTraceHdrs(web.Upload))
 
 	// These methods use short-expiry tokens in the URLs. These tokens may unintentionally
 	// be logged, so a new one must be generated for each request.
 	webBrowserRouter.Methods("GET").Path("/download/{bucket}/{object:.+}").Queries("token", "{token:.*}").HandlerFunc(web.Download)
-	webBrowserRouter.Methods("POST").Path("/zip").Queries("token", "{token:.*}").HandlerFunc(web.DownloadZip)
+	webBrowserRouter.Methods("POST").Path("/zip").Queries("token", "{token:.*}").HandlerFunc(httpTraceHdrs(web.DownloadZip))
 
 	// Add compression for assets.
 	h := http.FileServer(assetFS())

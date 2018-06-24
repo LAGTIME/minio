@@ -30,10 +30,12 @@ import (
 
 	b2 "github.com/minio/blazer/base"
 	"github.com/minio/cli"
-	"github.com/minio/minio-go/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/pkg/policy"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	h2 "github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/policy/condition"
 
 	minio "github.com/minio/minio/cmd"
 )
@@ -63,30 +65,27 @@ ENVIRONMENT VARIABLES:
   BROWSER:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
+  DOMAIN:
+     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
+
   CACHE:
      MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
      MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ";".
      MINIO_CACHE_EXPIRY: Cache expiry duration in days.
 
-  UPDATE:
-     MINIO_UPDATE: To turn off in-place upgrades, set this value to "off".
-
-  DOMAIN:
-     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
-
 EXAMPLES:
   1. Start minio gateway server for B2 backend.
-      $ export MINIO_ACCESS_KEY=accountID
-      $ export MINIO_SECRET_KEY=applicationKey
-      $ {{.HelpName}}
+     $ export MINIO_ACCESS_KEY=accountID
+     $ export MINIO_SECRET_KEY=applicationKey
+     $ {{.HelpName}}
 
   2. Start minio gateway server for B2 backend with edge caching enabled.
-      $ export MINIO_ACCESS_KEY=accountID
-      $ export MINIO_SECRET_KEY=applicationKey
-      $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
-      $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
-      $ export MINIO_CACHE_EXPIRY=40
-      $ {{.HelpName}}
+     $ export MINIO_ACCESS_KEY=accountID
+     $ export MINIO_SECRET_KEY=applicationKey
+     $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
+     $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
+     $ export MINIO_CACHE_EXPIRY=40
+     $ {{.HelpName}}
 `
 	minio.RegisterGatewayCommand(cli.Command{
 		Name:               b2Backend,
@@ -722,10 +721,15 @@ func (l *b2Objects) CompleteMultipartUpload(ctx context.Context, bucket string, 
 // bucketType.AllPublic - bucketTypeReadOnly means that anybody can download the files is the bucket;
 // bucketType.AllPrivate - bucketTypePrivate means that you need an authorization token to download them.
 // Default is AllPrivate for all buckets.
-func (l *b2Objects) SetBucketPolicy(ctx context.Context, bucket string, policyInfo policy.BucketAccessPolicy) error {
-	var policies []minio.BucketAccessPolicy
+func (l *b2Objects) SetBucketPolicy(ctx context.Context, bucket string, bucketPolicy *policy.Policy) error {
+	policyInfo, err := minio.PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		return b2ToObjectError(err, bucket)
+	}
 
-	for prefix, policy := range policy.GetPolicies(policyInfo.Statements, bucket, "") {
+	var policies []minio.BucketAccessPolicy
+	for prefix, policy := range miniogopolicy.GetPolicies(policyInfo.Statements, bucket, "") {
 		policies = append(policies, minio.BucketAccessPolicy{
 			Prefix: prefix,
 			Policy: policy,
@@ -740,7 +744,7 @@ func (l *b2Objects) SetBucketPolicy(ctx context.Context, bucket string, policyIn
 		logger.LogIf(ctx, minio.NotImplemented{})
 		return minio.NotImplemented{}
 	}
-	if policies[0].Policy != policy.BucketPolicyReadOnly {
+	if policies[0].Policy != miniogopolicy.BucketPolicyReadOnly {
 		logger.LogIf(ctx, minio.NotImplemented{})
 		return minio.NotImplemented{}
 	}
@@ -756,21 +760,39 @@ func (l *b2Objects) SetBucketPolicy(ctx context.Context, bucket string, policyIn
 
 // GetBucketPolicy, returns the current bucketType from B2 backend and convert
 // it into S3 compatible bucket policy info.
-func (l *b2Objects) GetBucketPolicy(ctx context.Context, bucket string) (policy.BucketAccessPolicy, error) {
-	policyInfo := policy.BucketAccessPolicy{Version: "2012-10-17"}
+func (l *b2Objects) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Policy, error) {
 	bkt, err := l.Bucket(ctx, bucket)
 	if err != nil {
-		return policyInfo, err
+		return nil, err
 	}
-	if bkt.Type == bucketTypeReadOnly {
-		policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyReadOnly, bucket, "")
-		return policyInfo, nil
-	}
+
 	// bkt.Type can also be snapshot, but it is only allowed through B2 browser console,
 	// just return back as policy not found for all cases.
 	// CreateBucket always sets the value to allPrivate by default.
-	logger.LogIf(ctx, minio.PolicyNotFound{Bucket: bucket})
-	return policy.BucketAccessPolicy{}, minio.PolicyNotFound{Bucket: bucket}
+	if bkt.Type != bucketTypeReadOnly {
+		logger.LogIf(ctx, minio.BucketPolicyNotFound{Bucket: bucket})
+		return nil, minio.BucketPolicyNotFound{Bucket: bucket}
+	}
+
+	return &policy.Policy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.Statement{
+			policy.NewStatement(
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				policy.NewActionSet(
+					policy.GetBucketLocationAction,
+					policy.ListBucketAction,
+					policy.GetObjectAction,
+				),
+				policy.NewResourceSet(
+					policy.NewResource(bucket, ""),
+					policy.NewResource(bucket, "*"),
+				),
+				condition.NewFunctions(),
+			),
+		},
+	}, nil
 }
 
 // DeleteBucketPolicy - resets the bucketType of bucket on B2 to 'allPrivate'.

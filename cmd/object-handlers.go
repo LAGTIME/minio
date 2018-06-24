@@ -31,12 +31,14 @@ import (
 	"sort"
 	"strconv"
 
-	mux "github.com/gorilla/mux"
+	"github.com/gorilla/mux"
+	miniogo "github.com/minio/minio-go"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/dns"
 	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/handlers"
 	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/ioutil"
+	"github.com/minio/minio/pkg/policy"
 	sha256 "github.com/minio/sha256-simd"
 	"github.com/minio/sio"
 )
@@ -60,23 +62,6 @@ func setHeadGetRespHeaders(w http.ResponseWriter, reqParams url.Values) {
 	}
 }
 
-// errAllowableNotFound - For an anon user, return 404 if have ListBucket, 403 otherwise
-// this is in keeping with the permissions sections of the docs of both:
-//   HEAD Object: http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html
-//   GET Object: http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html
-func errAllowableObjectNotFound(ctx context.Context, bucket string, r *http.Request) APIErrorCode {
-	if getRequestAuthType(r) == authTypeAnonymous {
-		// We care about the bucket as a whole, not a particular resource.
-		resource := "/" + bucket
-		sourceIP := handlers.GetSourceIP(r)
-		if s3Error := enforceBucketPolicy(ctx, bucket, "s3:ListBucket", resource,
-			r.Referer(), sourceIP, r.URL.Query()); s3Error != ErrNone {
-			return ErrAccessDenied
-		}
-	}
-	return ErrNoSuchKey
-}
-
 // GetObjectHandler - GET Object
 // ----------
 // This implementation of the GET operation retrieves object. To use GET,
@@ -96,23 +81,36 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:GetObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, s3Error, r.URL)
-		return
-	}
-
 	getObjectInfo := objectAPI.GetObjectInfo
 	if api.CacheAPI() != nil {
 		getObjectInfo = api.CacheAPI().GetObjectInfo
 	}
 
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, object); s3Error != ErrNone {
+		if getRequestAuthType(r) == authTypeAnonymous {
+			// As per "Permission" section in https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html
+			// If the object you request does not exist, the error Amazon S3 returns depends on whether you also have the s3:ListBucket permission.
+			// * If you have the s3:ListBucket permission on the bucket, Amazon S3 will return an HTTP status code 404 ("no such key") error.
+			// * if you don’t have the s3:ListBucket permission, Amazon S3 will return an HTTP status code 403 ("access denied") error.`
+			if globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.ListBucketAction,
+				BucketName:      bucket,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+			}) {
+				_, err := getObjectInfo(ctx, bucket, object)
+				if toAPIErrorCode(err) == ErrNoSuchKey {
+					s3Error = ErrNoSuchKey
+				}
+			}
+		}
+		writeErrorResponse(w, s3Error, r.URL)
+		return
+	}
+
 	objInfo, err := getObjectInfo(ctx, bucket, object)
 	if err != nil {
-		apiErr := toAPIErrorCode(err)
-		if apiErr == ErrNoSuchKey {
-			apiErr = errAllowableObjectNotFound(ctx, bucket, r)
-		}
-		writeErrorResponse(w, apiErr, r.URL)
+		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
 		return
 	}
 
@@ -232,23 +230,36 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:GetObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponseHeadersOnly(w, s3Error)
-		return
-	}
-
 	getObjectInfo := objectAPI.GetObjectInfo
 	if api.CacheAPI() != nil {
 		getObjectInfo = api.CacheAPI().GetObjectInfo
 	}
 
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, object); s3Error != ErrNone {
+		if getRequestAuthType(r) == authTypeAnonymous {
+			// As per "Permission" section in https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html
+			// If the object you request does not exist, the error Amazon S3 returns depends on whether you also have the s3:ListBucket permission.
+			// * If you have the s3:ListBucket permission on the bucket, Amazon S3 will return an HTTP status code 404 ("no such key") error.
+			// * if you don’t have the s3:ListBucket permission, Amazon S3 will return an HTTP status code 403 ("access denied") error.`
+			if globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.ListBucketAction,
+				BucketName:      bucket,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+			}) {
+				_, err := getObjectInfo(ctx, bucket, object)
+				if toAPIErrorCode(err) == ErrNoSuchKey {
+					s3Error = ErrNoSuchKey
+				}
+			}
+		}
+		writeErrorResponseHeadersOnly(w, s3Error)
+		return
+	}
+
 	objInfo, err := getObjectInfo(ctx, bucket, object)
 	if err != nil {
-		apiErr := toAPIErrorCode(err)
-		if apiErr == ErrNoSuchKey {
-			apiErr = errAllowableObjectNotFound(ctx, bucket, r)
-		}
-		writeErrorResponseHeadersOnly(w, apiErr)
+		writeErrorResponseHeadersOnly(w, toAPIErrorCode(err))
 		return
 	}
 
@@ -340,7 +351,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, dstBucket, "s3:PutObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -527,13 +538,73 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Copy source object to destination, if source and destination
-	// object is same then only metadata is updated.
-	objInfo, err := objectAPI.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo)
-	if err != nil {
-		pipeWriter.CloseWithError(err)
-		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
-		return
+	var objInfo ObjectInfo
+
+	// Checks if a remote putobject call is needed for CopyObject operation
+	// 1. If source and destination bucket names are same, it means no call needed to etcd to get destination info
+	// 2. If destination bucket doesn't exist locally, only then a etcd call is needed
+	var isRemoteCallRequired = func(ctx context.Context, src, dst string, objAPI ObjectLayer) bool {
+		if src == dst {
+			return false
+		}
+		_, berr := objAPI.GetBucketInfo(ctx, dst)
+		return berr == toObjectErr(errVolumeNotFound, dst)
+	}
+
+	// Returns a minio-go Client configured to access remote host described by destDNSRecord
+	// Applicable only in a federated deployment
+	var getRemoteInstanceClient = func(host string, port int) (*miniogo.Core, error) {
+		// In a federated deployment, all the instances share config files and hence expected to have same
+		// credentials. So, access current instances creds and use it to create client for remote instance
+		endpoint := net.JoinHostPort(host, strconv.Itoa(port))
+		accessKey := globalServerConfig.Credential.AccessKey
+		secretKey := globalServerConfig.Credential.SecretKey
+		return miniogo.NewCore(endpoint, accessKey, secretKey, globalIsSSL)
+	}
+
+	if isRemoteCallRequired(ctx, srcBucket, dstBucket, objectAPI) {
+		if globalDNSConfig == nil {
+			writeErrorResponse(w, ErrNoSuchBucket, r.URL)
+			return
+		}
+		var dstRecords []dns.SrvRecord
+		if dstRecords, err = globalDNSConfig.Get(dstBucket); err == nil {
+			go func() {
+				if gerr := objectAPI.GetObject(ctx, srcBucket, srcObject, 0, srcInfo.Size, srcInfo.Writer, srcInfo.ETag); gerr != nil {
+					pipeWriter.CloseWithError(gerr)
+					writeErrorResponse(w, ErrInternalError, r.URL)
+					return
+				}
+				// Close writer explicitly to indicate data has been written
+				srcInfo.Writer.Close()
+			}()
+
+			// Send PutObject request to appropriate instance (in federated deployment)
+			host, port := getRandomHostPort(dstRecords)
+			client, rerr := getRemoteInstanceClient(host, port)
+			if rerr != nil {
+				pipeWriter.CloseWithError(rerr)
+				writeErrorResponse(w, ErrInternalError, r.URL)
+				return
+			}
+			remoteObjInfo, rerr := client.PutObject(dstBucket, dstObject, srcInfo.Reader, srcInfo.Size, "", "", srcInfo.UserDefined)
+			if rerr != nil {
+				pipeWriter.CloseWithError(rerr)
+				writeErrorResponse(w, ErrInternalError, r.URL)
+				return
+			}
+			objInfo.ETag = remoteObjInfo.ETag
+			objInfo.ModTime = remoteObjInfo.LastModified
+		}
+	} else {
+		// Copy source object to destination, if source and destination
+		// object is same then only metadata is updated.
+		objInfo, err = objectAPI.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo)
+		if err != nil {
+			pipeWriter.CloseWithError(err)
+			writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+			return
+		}
 	}
 
 	pipeReader.Close()
@@ -666,10 +737,14 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(w, ErrAccessDenied, r.URL)
 		return
 	case authTypeAnonymous:
-		// http://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
-		sourceIP := handlers.GetSourceIP(r)
-		if s3Err = enforceBucketPolicy(ctx, bucket, "s3:PutObject", r.URL.Path, r.Referer(), sourceIP, r.URL.Query()); s3Err != ErrNone {
-			writeErrorResponse(w, s3Err, r.URL)
+		if !globalPolicySys.IsAllowed(policy.Args{
+			Action:          policy.PutObjectAction,
+			BucketName:      bucket,
+			ConditionValues: getConditionValues(r, ""),
+			IsOwner:         false,
+			ObjectName:      object,
+		}) {
+			writeErrorResponse(w, ErrAccessDenied, r.URL)
 			return
 		}
 	case authTypeStreamingSigned:
@@ -781,7 +856,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:PutObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -867,7 +942,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, dstBucket, "s3:PutObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -1133,10 +1208,14 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		writeErrorResponse(w, ErrAccessDenied, r.URL)
 		return
 	case authTypeAnonymous:
-		// http://docs.aws.amazon.com/AmazonS3/latest/dev/mpuAndPermissions.html
-		if s3Error := enforceBucketPolicy(ctx, bucket, "s3:PutObject", r.URL.Path,
-			r.Referer(), handlers.GetSourceIP(r), r.URL.Query()); s3Error != ErrNone {
-			writeErrorResponse(w, s3Error, r.URL)
+		if !globalPolicySys.IsAllowed(policy.Args{
+			Action:          policy.PutObjectAction,
+			BucketName:      bucket,
+			ConditionValues: getConditionValues(r, ""),
+			IsOwner:         false,
+			ObjectName:      object,
+		}) {
+			writeErrorResponse(w, ErrAccessDenied, r.URL)
 			return
 		}
 	case authTypeStreamingSigned:
@@ -1262,7 +1341,8 @@ func (api objectAPIHandlers) AbortMultipartUploadHandler(w http.ResponseWriter, 
 	if api.CacheAPI() != nil {
 		abortMultipartUpload = api.CacheAPI().AbortMultipartUpload
 	}
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:AbortMultipartUpload", globalServerConfig.GetRegion()); s3Error != ErrNone {
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.AbortMultipartUploadAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -1297,7 +1377,7 @@ func (api objectAPIHandlers) ListObjectPartsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:ListMultipartUploadParts", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListMultipartUploadPartsAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -1337,7 +1417,7 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:PutObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
@@ -1446,7 +1526,7 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, bucket, "s3:DeleteObject", globalServerConfig.GetRegion()); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.DeleteObjectAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}

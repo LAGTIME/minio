@@ -34,10 +34,12 @@ import (
 	"github.com/Azure/azure-sdk-for-go/storage"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/cli"
-	"github.com/minio/minio-go/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/pkg/policy"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/policy/condition"
 	sha256 "github.com/minio/sha256-simd"
 
 	minio "github.com/minio/minio/cmd"
@@ -49,6 +51,7 @@ const (
 	azureS3MinPartSize         = 5 * humanize.MiByte
 	metadataObjectNameTemplate = minio.GatewayMinioSysTmp + "multipart/v1/%s.%x/azure.json"
 	azureBackend               = "azure"
+	azureMarkerPrefix          = "{minio}"
 )
 
 func init() {
@@ -72,36 +75,32 @@ ENVIRONMENT VARIABLES:
   BROWSER:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
+  DOMAIN:
+     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
+
   CACHE:
      MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
      MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ";".
      MINIO_CACHE_EXPIRY: Cache expiry duration in days.
 
-  UPDATE:
-     MINIO_UPDATE: To turn off in-place upgrades, set this value to "off".
-
-  DOMAIN:
-     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
-
 EXAMPLES:
   1. Start minio gateway server for Azure Blob Storage backend.
-      $ export MINIO_ACCESS_KEY=azureaccountname
-      $ export MINIO_SECRET_KEY=azureaccountkey
-      $ {{.HelpName}}
+     $ export MINIO_ACCESS_KEY=azureaccountname
+     $ export MINIO_SECRET_KEY=azureaccountkey
+     $ {{.HelpName}}
 
   2. Start minio gateway server for Azure Blob Storage backend on custom endpoint.
-      $ export MINIO_ACCESS_KEY=azureaccountname
-      $ export MINIO_SECRET_KEY=azureaccountkey
-      $ {{.HelpName}} https://azure.example.com
+     $ export MINIO_ACCESS_KEY=azureaccountname
+     $ export MINIO_SECRET_KEY=azureaccountkey
+     $ {{.HelpName}} https://azure.example.com
 
   3. Start minio gateway server for Azure Blob Storage backend with edge caching enabled.
-      $ export MINIO_ACCESS_KEY=azureaccountname
-      $ export MINIO_SECRET_KEY=azureaccountkey
-      $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
-      $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
-      $ export MINIO_CACHE_EXPIRY=40
-      $ {{.HelpName}}
-
+     $ export MINIO_ACCESS_KEY=azureaccountname
+     $ export MINIO_SECRET_KEY=azureaccountkey
+     $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
+     $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
+     $ export MINIO_CACHE_EXPIRY=40
+     $ {{.HelpName}}
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
@@ -111,6 +110,12 @@ EXAMPLES:
 		CustomHelpTemplate: azureGatewayTemplate,
 		HideHelpCommand:    true,
 	})
+}
+
+// Returns true if marker was returned by Azure, i.e prefixed with
+// {minio}
+func isAzureMarker(marker string) bool {
+	return strings.HasPrefix(marker, azureMarkerPrefix)
 }
 
 // Handler for 'minio gateway azure' command line.
@@ -155,6 +160,7 @@ func (g *Azure) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, erro
 	if err != nil {
 		return &azureObjects{}, err
 	}
+	c.AddToUserAgent(fmt.Sprintf("APN/1.0 Minio/1.0 Minio/%s", minio.Version))
 	c.HTTPClient = &http.Client{Transport: minio.NewCustomHTTPTransport()}
 
 	return &azureObjects{
@@ -232,6 +238,8 @@ func s3MetaToAzureProperties(ctx context.Context, s3Metadata map[string]string) 
 			props.ContentMD5 = v
 		case k == "Content-Type":
 			props.ContentType = v
+		case k == "Content-Language":
+			props.ContentLanguage = v
 		}
 	}
 	return blobMeta, props, nil
@@ -285,6 +293,9 @@ func azurePropertiesToS3Meta(meta storage.BlobMetadata, props storage.BlobProper
 	}
 	if props.ContentType != "" {
 		s3Metadata["Content-Type"] = props.ContentType
+	}
+	if props.ContentLanguage != "" {
+		s3Metadata["Content-Language"] = props.ContentLanguage
 	}
 	return s3Metadata
 }
@@ -344,21 +355,21 @@ func azureToObjectError(err error, params ...string) error {
 	return err
 }
 
-// mustGetAzureUploadID - returns new upload ID which is hex encoded 8 bytes random value.
+// getAzureUploadID - returns new upload ID which is hex encoded 8 bytes random value.
 // this 8 byte restriction is needed because Azure block id has a restriction of length
 // upto 8 bytes.
-func mustGetAzureUploadID() string {
+func getAzureUploadID() (string, error) {
 	var id [8]byte
 
 	n, err := io.ReadFull(rand.Reader, id[:])
 	if err != nil {
-		panic(fmt.Errorf("unable to generate upload ID for azure. %s", err))
+		return "", err
 	}
 	if n != len(id) {
-		panic(fmt.Errorf("insufficient random data (expected: %d, read: %d)", len(id), n))
+		return "", fmt.Errorf("Unexpected random data size. Expected: %d, read: %d)", len(id), n)
 	}
 
-	return hex.EncodeToString(id[:])
+	return hex.EncodeToString(id[:]), nil
 }
 
 // checkAzureUploadID - returns error in case of given string is upload ID.
@@ -431,6 +442,15 @@ func (a *azureObjects) StorageInfo(ctx context.Context) (si minio.StorageInfo) {
 
 // MakeBucketWithLocation - Create a new container on azure backend.
 func (a *azureObjects) MakeBucketWithLocation(ctx context.Context, bucket, location string) error {
+	// Verify if bucket (container-name) is valid.
+	// IsValidBucketName has same restrictions as container names mentioned
+	// in azure documentation, so we will simply use the same function here.
+	// Ref - https://docs.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
+	if !minio.IsValidBucketName(bucket) {
+		logger.LogIf(ctx, minio.BucketNameInvalid{Bucket: bucket})
+		return minio.BucketNameInvalid{Bucket: bucket}
+	}
+
 	container := a.client.GetContainerReference(bucket)
 	err := container.Create(&storage.CreateContainerOptions{
 		Access: storage.ContainerAccessTypePrivate,
@@ -441,15 +461,6 @@ func (a *azureObjects) MakeBucketWithLocation(ctx context.Context, bucket, locat
 
 // GetBucketInfo - Get bucket metadata..
 func (a *azureObjects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, e error) {
-	// Verify if bucket (container-name) is valid.
-	// IsValidBucketName has same restrictions as container names mentioned
-	// in azure documentation, so we will simply use the same function here.
-	// Ref - https://docs.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
-	if !minio.IsValidBucketName(bucket) {
-		logger.LogIf(ctx, minio.BucketNameInvalid{Bucket: bucket})
-		return bi, minio.BucketNameInvalid{Bucket: bucket}
-	}
-
 	// Azure does not have an equivalent call, hence use
 	// ListContainers with prefix
 	resp, err := a.client.ListContainers(storage.ListContainersParameters{
@@ -505,14 +516,34 @@ func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string) error {
 
 // ListObjects - lists all blobs on azure with in a container filtered by prefix
 // and marker, uses Azure equivalent ListBlobs.
+// To accommodate S3-compatible applications using
+// ListObjectsV1 to use object keys as markers to control the
+// listing of objects, we use the following encoding scheme to
+// distinguish between Azure continuation tokens and application
+// supplied markers.
+//
+// - NextMarker in ListObjectsV1 response is constructed by
+//   prefixing "{minio}" to the Azure continuation token,
+//   e.g, "{minio}CgRvYmoz"
+//
+// - Application supplied markers are used as-is to list
+//   object keys that appear after it in the lexicographical order.
 func (a *azureObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (result minio.ListObjectsInfo, err error) {
 	var objects []minio.ObjectInfo
 	var prefixes []string
+
+	azureListMarker := ""
+	if isAzureMarker(marker) {
+		// If application is using Azure continuation token we should
+		// strip the azureTokenPrefix we added in the previous list response.
+		azureListMarker = strings.TrimPrefix(marker, azureMarkerPrefix)
+	}
+
 	container := a.client.GetContainerReference(bucket)
 	for len(objects) == 0 && len(prefixes) == 0 {
 		resp, err := container.ListBlobs(storage.ListBlobsParameters{
 			Prefix:     prefix,
-			Marker:     marker,
+			Marker:     azureListMarker,
 			Delimiter:  delimiter,
 			MaxResults: uint(maxKeys),
 		})
@@ -521,38 +552,57 @@ func (a *azureObjects) ListObjects(ctx context.Context, bucket, prefix, marker, 
 			return result, azureToObjectError(err, bucket, prefix)
 		}
 
-		for _, object := range resp.Blobs {
-			if strings.HasPrefix(object.Name, minio.GatewayMinioSysTmp) {
+		for _, blob := range resp.Blobs {
+			if delimiter == "" && strings.HasPrefix(blob.Name, minio.GatewayMinioSysTmp) {
+				// We filter out minio.GatewayMinioSysTmp entries in the recursive listing.
+				continue
+			}
+			if !isAzureMarker(marker) && blob.Name <= marker {
+				// If the application used ListObjectsV1 style marker then we
+				// skip all the entries till we reach the marker.
 				continue
 			}
 			objects = append(objects, minio.ObjectInfo{
 				Bucket:          bucket,
-				Name:            object.Name,
-				ModTime:         time.Time(object.Properties.LastModified),
-				Size:            object.Properties.ContentLength,
-				ETag:            minio.ToS3ETag(object.Properties.Etag),
-				ContentType:     object.Properties.ContentType,
-				ContentEncoding: object.Properties.ContentEncoding,
+				Name:            blob.Name,
+				ModTime:         time.Time(blob.Properties.LastModified),
+				Size:            blob.Properties.ContentLength,
+				ETag:            minio.ToS3ETag(blob.Properties.Etag),
+				ContentType:     blob.Properties.ContentType,
+				ContentEncoding: blob.Properties.ContentEncoding,
 			})
 		}
 
-		// Remove minio.sys.tmp prefix.
-		for _, prefix := range resp.BlobPrefixes {
-			if prefix != minio.GatewayMinioSysTmp {
-				prefixes = append(prefixes, prefix)
+		for _, blobPrefix := range resp.BlobPrefixes {
+			if blobPrefix == minio.GatewayMinioSysTmp {
+				// We don't do strings.HasPrefix(blob.Name, minio.GatewayMinioSysTmp) here so that
+				// we can use tools like mc to inspect the contents of minio.sys.tmp/
+				// It is OK to allow listing of minio.sys.tmp/ in non-recursive mode as it aids in debugging.
+				continue
 			}
+			if !isAzureMarker(marker) && blobPrefix <= marker {
+				// If the application used ListObjectsV1 style marker then we
+				// skip all the entries till we reach the marker.
+				continue
+			}
+			prefixes = append(prefixes, blobPrefix)
 		}
 
-		marker = resp.NextMarker
-		if resp.NextMarker == "" {
+		azureListMarker = resp.NextMarker
+		if azureListMarker == "" {
+			// Reached end of listing.
 			break
 		}
 	}
 
 	result.Objects = objects
 	result.Prefixes = prefixes
-	result.NextMarker = marker
-	result.IsTruncated = (marker != "")
+	if azureListMarker != "" {
+		// We add the {minio} prefix so that we know in the subsequent request that this
+		// marker is a azure continuation token and not ListObjectV1 marker.
+		result.NextMarker = azureMarkerPrefix + azureListMarker
+		result.IsTruncated = true
+	}
 	return result, nil
 }
 
@@ -668,6 +718,17 @@ func (a *azureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, des
 		logger.LogIf(ctx, err)
 		return objInfo, azureToObjectError(err, srcBucket, srcObject)
 	}
+	// Azure will copy metadata from the source object when an empty metadata map is provided.
+	// To handle the case where the source object should be copied without its metadata,
+	// the metadata must be removed from the dest. object after the copy completes
+	if len(azureMeta) == 0 && len(destBlob.Metadata) != 0 {
+		destBlob.Metadata = azureMeta
+		err = destBlob.SetMetadata(nil)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return objInfo, azureToObjectError(err, srcBucket, srcObject)
+		}
+	}
 	destBlob.Properties = props
 	err = destBlob.SetProperties(nil)
 	if err != nil {
@@ -724,7 +785,11 @@ func (a *azureObjects) checkUploadIDExists(ctx context.Context, bucketName, obje
 
 // NewMultipartUpload - Use Azure equivalent CreateBlockBlob.
 func (a *azureObjects) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string) (uploadID string, err error) {
-	uploadID = mustGetAzureUploadID()
+	uploadID, err = getAzureUploadID()
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return "", err
+	}
 	metadataObject := getAzureMetadataObjectName(object, uploadID)
 
 	var jsonData []byte
@@ -1016,10 +1081,16 @@ func (a *azureObjects) CompleteMultipartUpload(ctx context.Context, bucket, obje
 // storage.ContainerAccessTypePrivate - none in minio terminology
 // As the common denominator for minio and azure is readonly and none, we support
 // these two policies at the bucket level.
-func (a *azureObjects) SetBucketPolicy(ctx context.Context, bucket string, policyInfo policy.BucketAccessPolicy) error {
-	var policies []minio.BucketAccessPolicy
+func (a *azureObjects) SetBucketPolicy(ctx context.Context, bucket string, bucketPolicy *policy.Policy) error {
+	policyInfo, err := minio.PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		logger.LogIf(ctx, err)
+		return azureToObjectError(err, bucket)
+	}
 
-	for prefix, policy := range policy.GetPolicies(policyInfo.Statements, bucket, "") {
+	var policies []minio.BucketAccessPolicy
+	for prefix, policy := range miniogopolicy.GetPolicies(policyInfo.Statements, bucket, "") {
 		policies = append(policies, minio.BucketAccessPolicy{
 			Prefix: prefix,
 			Policy: policy,
@@ -1034,7 +1105,7 @@ func (a *azureObjects) SetBucketPolicy(ctx context.Context, bucket string, polic
 		logger.LogIf(ctx, minio.NotImplemented{})
 		return minio.NotImplemented{}
 	}
-	if policies[0].Policy != policy.BucketPolicyReadOnly {
+	if policies[0].Policy != miniogopolicy.BucketPolicyReadOnly {
 		logger.LogIf(ctx, minio.NotImplemented{})
 		return minio.NotImplemented{}
 	}
@@ -1043,31 +1114,47 @@ func (a *azureObjects) SetBucketPolicy(ctx context.Context, bucket string, polic
 		AccessPolicies: nil,
 	}
 	container := a.client.GetContainerReference(bucket)
-	err := container.SetPermissions(perm, nil)
+	err = container.SetPermissions(perm, nil)
 	logger.LogIf(ctx, err)
 	return azureToObjectError(err, bucket)
 }
 
 // GetBucketPolicy - Get the container ACL and convert it to canonical []bucketAccessPolicy
-func (a *azureObjects) GetBucketPolicy(ctx context.Context, bucket string) (policy.BucketAccessPolicy, error) {
-	policyInfo := policy.BucketAccessPolicy{Version: "2012-10-17"}
+func (a *azureObjects) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Policy, error) {
 	container := a.client.GetContainerReference(bucket)
 	perm, err := container.GetPermissions(nil)
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return policy.BucketAccessPolicy{}, azureToObjectError(err, bucket)
+		return nil, azureToObjectError(err, bucket)
 	}
-	switch perm.AccessType {
-	case storage.ContainerAccessTypePrivate:
-		logger.LogIf(ctx, minio.PolicyNotFound{Bucket: bucket})
-		return policy.BucketAccessPolicy{}, minio.PolicyNotFound{Bucket: bucket}
-	case storage.ContainerAccessTypeContainer:
-		policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyReadOnly, bucket, "")
-	default:
+
+	if perm.AccessType == storage.ContainerAccessTypePrivate {
+		logger.LogIf(ctx, minio.BucketPolicyNotFound{Bucket: bucket})
+		return nil, minio.BucketPolicyNotFound{Bucket: bucket}
+	} else if perm.AccessType != storage.ContainerAccessTypeContainer {
 		logger.LogIf(ctx, minio.NotImplemented{})
-		return policy.BucketAccessPolicy{}, azureToObjectError(minio.NotImplemented{})
+		return nil, azureToObjectError(minio.NotImplemented{})
 	}
-	return policyInfo, nil
+
+	return &policy.Policy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.Statement{
+			policy.NewStatement(
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				policy.NewActionSet(
+					policy.GetBucketLocationAction,
+					policy.ListBucketAction,
+					policy.GetObjectAction,
+				),
+				policy.NewResourceSet(
+					policy.NewResource(bucket, ""),
+					policy.NewResource(bucket, "*"),
+				),
+				condition.NewFunctions(),
+			),
+		},
+	}, nil
 }
 
 // DeleteBucketPolicy - Set the container ACL to "private"

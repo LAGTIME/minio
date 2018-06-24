@@ -33,6 +33,60 @@ import (
 	"github.com/minio/minio/pkg/disk"
 )
 
+// Tests validate volume name.
+func TestIsValidVolname(t *testing.T) {
+	testCases := []struct {
+		volName    string
+		shouldPass bool
+	}{
+		// Cases which should pass the test.
+		// passing in valid bucket names.
+		{"lol", true},
+		{"1-this-is-valid", true},
+		{"1-this-too-is-valid-1", true},
+		{"this.works.too.1", true},
+		{"1234567", true},
+		{"123", true},
+		{"s3-eu-west-1.amazonaws.com", true},
+		{"ideas-are-more-powerful-than-guns", true},
+		{"testbucket", true},
+		{"1bucket", true},
+		{"bucket1", true},
+		{"$this-is-not-valid-too", true},
+		{"contains-$-dollar", true},
+		{"contains-^-carrot", true},
+		{"contains-$-dollar", true},
+		{"contains-$-dollar", true},
+		{".starts-with-a-dot", true},
+		{"ends-with-a-dot.", true},
+		{"ends-with-a-dash-", true},
+		{"-starts-with-a-dash", true},
+		{"THIS-BEINGS-WITH-UPPERCASe", true},
+		{"tHIS-ENDS-WITH-UPPERCASE", true},
+		{"ThisBeginsAndEndsWithUpperCase", true},
+		{"una ñina", true},
+		{"lalalallalallalalalallalallalala-theString-size-is-greater-than-64", true},
+		// cases for which test should fail.
+		// passing invalid bucket names.
+		{"", false},
+		{"/", false},
+		{"a", false},
+		{"ab", false},
+		{"ab/", true},
+		{"......", true},
+	}
+
+	for i, testCase := range testCases {
+		isValidVolname := isValidVolname(testCase.volName)
+		if testCase.shouldPass && !isValidVolname {
+			t.Errorf("Test case %d: Expected \"%s\" to be a valid bucket name", i+1, testCase.volName)
+		}
+		if !testCase.shouldPass && isValidVolname {
+			t.Errorf("Test case %d: Expected bucket name \"%s\" to be invalid", i+1, testCase.volName)
+		}
+	}
+}
+
 // creates a temp dir and sets up posix layer.
 // returns posix layer, temp dir path to be used for the purpose of tests.
 func newPosixTestSetup() (StorageAPI, string, error) {
@@ -231,7 +285,7 @@ func TestPosixReadAll(t *testing.T) {
 		{
 			volume: "ab",
 			path:   "as-file",
-			err:    errInvalidArgument,
+			err:    errVolumeNotFound,
 		},
 	}
 
@@ -477,7 +531,7 @@ func TestPosixDeleteVol(t *testing.T) {
 		{
 			volName:     "ab",
 			ioErrCount:  0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 	}
 
@@ -588,7 +642,7 @@ func TestPosixStatVol(t *testing.T) {
 		{
 			volName:     "ab",
 			ioErrCount:  0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 	}
 
@@ -756,7 +810,7 @@ func TestPosixPosixListDir(t *testing.T) {
 			srcVol:      "ab",
 			srcPath:     "success-file",
 			ioErrCnt:    0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestPosix case - 4.
 		// TestPosix case with io error count > max limit.
@@ -785,7 +839,7 @@ func TestPosixPosixListDir(t *testing.T) {
 		} else {
 			t.Errorf("Expected the StorageAPI to be of type *posix")
 		}
-		dirList, err = posixStorage.ListDir(testCase.srcVol, testCase.srcPath)
+		dirList, err = posixStorage.ListDir(testCase.srcVol, testCase.srcPath, -1)
 		if err != testCase.expectedErr {
 			t.Fatalf("TestPosix case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
@@ -902,7 +956,7 @@ func TestPosixDeleteFile(t *testing.T) {
 			srcVol:      "my",
 			srcPath:     "success-file",
 			ioErrCnt:    0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestPosix case - 5.
 		// TestPosix case with non-existent volume.
@@ -1068,7 +1122,7 @@ func TestPosixReadFile(t *testing.T) {
 		},
 		// Empty volume name. - 12
 		{
-			"", "myobject", 14, 1, nil, errInvalidArgument,
+			"", "myobject", 14, 1, nil, errVolumeNotFound,
 		},
 		// Empty filename name. - 13
 		{
@@ -1374,7 +1428,7 @@ func TestPosixAppendFile(t *testing.T) {
 	// TestPosix case with invalid volume name.
 	// A valid volume name should be atleast of size 3.
 	err = posixStorage.AppendFile("bn", "yes", []byte("hello, world"))
-	if err != errInvalidArgument {
+	if err != errVolumeNotFound {
 		t.Fatalf("expected: \"Invalid argument error\", got: \"%s\"", err)
 	}
 
@@ -1472,17 +1526,17 @@ func TestPosixPrepareFile(t *testing.T) {
 		}
 	}
 
-	// TestPosix case with invalid file size which should be strictly positive
-	err = posixStorage.PrepareFile("bn", "yes", -3)
-	if err != errInvalidArgument {
-		t.Fatalf("should fail: %v", err)
-	}
-
 	// TestPosix case with invalid volume name.
 	// A valid volume name should be atleast of size 3.
 	err = posixStorage.PrepareFile("bn", "yes", 16)
-	if err != errInvalidArgument {
+	if err != errVolumeNotFound {
 		t.Fatalf("expected: \"Invalid argument error\", got: \"%s\"", err)
+	}
+
+	// TestPosix case with invalid file size which should be strictly positive
+	err = posixStorage.PrepareFile("success-vol", "yes", -3)
+	if err != errInvalidArgument {
+		t.Fatalf("should fail: %v", err)
 	}
 
 	// TestPosix case with IO error count > max limit.
@@ -1681,7 +1735,7 @@ func TestPosixRenameFile(t *testing.T) {
 			srcPath:     "file4",
 			destPath:    "new-path/",
 			ioErrCnt:    0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestPosix case - 14.
 		// TestPosix case with invalid destination volume name. Length should be atleast 3.
@@ -1692,7 +1746,7 @@ func TestPosixRenameFile(t *testing.T) {
 			srcPath:     "file4",
 			destPath:    "new-path/",
 			ioErrCnt:    0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestPosix case - 15.
 		// TestPosix case with invalid destination volume name. Length should be atleast 3.
@@ -1703,7 +1757,7 @@ func TestPosixRenameFile(t *testing.T) {
 			srcPath:     "file4",
 			destPath:    "new-path/",
 			ioErrCnt:    0,
-			expectedErr: errInvalidArgument,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestPosix case - 16.
 		// TestPosix case with the parent of the destination being a file.

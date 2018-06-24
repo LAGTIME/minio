@@ -33,10 +33,12 @@ import (
 	"cloud.google.com/go/storage"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/cli"
-	"github.com/minio/minio-go/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/pkg/policy"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/policy/condition"
 
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
@@ -109,36 +111,33 @@ ENVIRONMENT VARIABLES:
   BROWSER:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
+  DOMAIN:
+     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
+
   CACHE:
      MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
      MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ";".
      MINIO_CACHE_EXPIRY: Cache expiry duration in days.
-
-  UPDATE:
-     MINIO_UPDATE: To turn off in-place upgrades, set this value to "off".
-
-  DOMAIN:
-     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
 
   GCS credentials file:
      GOOGLE_APPLICATION_CREDENTIALS: Path to credentials.json
 
 EXAMPLES:
   1. Start minio gateway server for GCS backend.
-      $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
-      (Instructions to generate credentials : https://developers.google.com/identity/protocols/application-default-credentials)
-      $ export MINIO_ACCESS_KEY=accesskey
-      $ export MINIO_SECRET_KEY=secretkey
-      $ {{.HelpName}} mygcsprojectid
+     $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+     (Instructions to generate credentials : https://developers.google.com/identity/protocols/application-default-credentials)
+     $ export MINIO_ACCESS_KEY=accesskey
+     $ export MINIO_SECRET_KEY=secretkey
+     $ {{.HelpName}} mygcsprojectid
 
   2. Start minio gateway server for GCS backend with edge caching enabled.
-      $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
-      $ export MINIO_ACCESS_KEY=accesskey
-      $ export MINIO_SECRET_KEY=secretkey
-      $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
-      $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
-      $ export MINIO_CACHE_EXPIRY=40
-      $ {{.HelpName}} mygcsprojectid
+     $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+     $ export MINIO_ACCESS_KEY=accesskey
+     $ export MINIO_SECRET_KEY=secretkey
+     $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
+     $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
+     $ export MINIO_CACHE_EXPIRY=40
+     $ {{.HelpName}} mygcsprojectid
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
@@ -570,8 +569,8 @@ func (l *gcsGateway) ListObjects(ctx context.Context, bucket string, prefix stri
 	// supplied markers.
 	//
 	// - NextMarker in ListObjectsV1 response is constructed by
-	//   prefixing "##minio" to the GCS continuation token,
-	//   e.g, "##minioCgRvYmoz"
+	//   prefixing "{minio}" to the GCS continuation token,
+	//   e.g, "{minio}CgRvYmoz"
 	//
 	// - Application supplied markers are used as-is to list
 	//   object keys that appear after it in the lexicographical order.
@@ -758,15 +757,54 @@ func (l *gcsGateway) GetObject(ctx context.Context, bucket string, key string, s
 func fromGCSAttrsToObjectInfo(attrs *storage.ObjectAttrs) minio.ObjectInfo {
 	// All google cloud storage objects have a CRC32c hash, whereas composite objects may not have a MD5 hash
 	// Refer https://cloud.google.com/storage/docs/hashes-etags. Use CRC32C for ETag
+	metadata := make(map[string]string)
+	for k, v := range attrs.Metadata {
+		metadata[k] = v
+	}
+	if attrs.ContentType != "" {
+		metadata["content-type"] = attrs.ContentType
+	}
+	if attrs.ContentEncoding != "" {
+		metadata["content-encoding"] = attrs.ContentEncoding
+	}
+	if attrs.CacheControl != "" {
+		metadata["cache-control"] = attrs.CacheControl
+	}
+	if attrs.ContentDisposition != "" {
+		metadata["content-disposition"] = attrs.ContentDisposition
+	}
+	if attrs.ContentLanguage != "" {
+		metadata["content-language"] = attrs.ContentLanguage
+	}
 	return minio.ObjectInfo{
 		Name:            attrs.Name,
 		Bucket:          attrs.Bucket,
 		ModTime:         attrs.Updated,
 		Size:            attrs.Size,
 		ETag:            minio.ToS3ETag(fmt.Sprintf("%d", attrs.CRC32C)),
-		UserDefined:     attrs.Metadata,
+		UserDefined:     metadata,
 		ContentType:     attrs.ContentType,
 		ContentEncoding: attrs.ContentEncoding,
+	}
+}
+
+// applyMetadataToGCSAttrs applies metadata to a GCS ObjectAttrs instance
+func applyMetadataToGCSAttrs(metadata map[string]string, attrs *storage.ObjectAttrs) {
+	attrs.ContentType = metadata["content-type"]
+	attrs.ContentEncoding = metadata["content-encoding"]
+	attrs.CacheControl = metadata["cache-control"]
+	attrs.ContentDisposition = metadata["content-disposition"]
+	attrs.ContentLanguage = metadata["content-language"]
+
+	attrs.Metadata = make(map[string]string)
+	for k, v := range metadata {
+		attrs.Metadata[k] = v
+	}
+	// Filter metadata which is stored as a unique attribute
+	for _, key := range []string{
+		"content-type", "content-encoding", "cache-control", "content-disposition", "content-language",
+	} {
+		delete(attrs.Metadata, key)
 	}
 }
 
@@ -800,10 +838,12 @@ func (l *gcsGateway) PutObject(ctx context.Context, bucket string, key string, d
 	object := l.client.Bucket(bucket).Object(key)
 
 	w := object.NewWriter(l.ctx)
-
-	w.ContentType = metadata["content-type"]
-	w.ContentEncoding = metadata["content-encoding"]
-	w.Metadata = metadata
+	// Disable "chunked" uploading in GCS client if the size of the data to be uploaded is below
+	// the current chunk-size of the writer. This avoids an unnecessary memory allocation.
+	if data.Size() < int64(w.ChunkSize) {
+		w.ChunkSize = 0
+	}
+	applyMetadataToGCSAttrs(metadata, &w.ObjectAttrs)
 
 	if _, err := io.Copy(w, data); err != nil {
 		// Close the object writer upon error.
@@ -832,7 +872,7 @@ func (l *gcsGateway) CopyObject(ctx context.Context, srcBucket string, srcObject
 	dst := l.client.Bucket(destBucket).Object(destObject)
 
 	copier := dst.CopierFrom(src)
-	copier.ObjectAttrs.Metadata = srcInfo.UserDefined
+	applyMetadataToGCSAttrs(srcInfo.UserDefined, &copier.ObjectAttrs)
 
 	attrs, err := copier.Run(l.ctx)
 	if err != nil {
@@ -865,9 +905,7 @@ func (l *gcsGateway) NewMultipartUpload(ctx context.Context, bucket string, key 
 	w := l.client.Bucket(bucket).Object(meta).NewWriter(l.ctx)
 	defer w.Close()
 
-	w.ContentType = metadata["content-type"]
-	w.ContentEncoding = metadata["content-encoding"]
-	w.Metadata = metadata
+	applyMetadataToGCSAttrs(metadata, &w.ObjectAttrs)
 
 	if err = json.NewEncoder(w).Encode(gcsMultipartMetaV1{
 		gcsMinioMultipartMetaCurrentVersion,
@@ -1076,6 +1114,10 @@ func (l *gcsGateway) CompleteMultipartUpload(ctx context.Context, bucket string,
 
 	composer := l.client.Bucket(bucket).Object(key).ComposerFrom(parts...)
 	composer.ContentType = partZeroAttrs.ContentType
+	composer.ContentEncoding = partZeroAttrs.ContentEncoding
+	composer.CacheControl = partZeroAttrs.CacheControl
+	composer.ContentDisposition = partZeroAttrs.ContentDisposition
+	composer.ContentLanguage = partZeroAttrs.ContentLanguage
 	composer.Metadata = partZeroAttrs.Metadata
 	attrs, err := composer.Run(l.ctx)
 	if err != nil {
@@ -1089,10 +1131,16 @@ func (l *gcsGateway) CompleteMultipartUpload(ctx context.Context, bucket string,
 }
 
 // SetBucketPolicy - Set policy on bucket
-func (l *gcsGateway) SetBucketPolicy(ctx context.Context, bucket string, policyInfo policy.BucketAccessPolicy) error {
-	var policies []minio.BucketAccessPolicy
+func (l *gcsGateway) SetBucketPolicy(ctx context.Context, bucket string, bucketPolicy *policy.Policy) error {
+	policyInfo, err := minio.PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket)
+	}
 
-	for prefix, policy := range policy.GetPolicies(policyInfo.Statements, bucket, "") {
+	var policies []minio.BucketAccessPolicy
+	for prefix, policy := range miniogopolicy.GetPolicies(policyInfo.Statements, bucket, "") {
 		policies = append(policies, minio.BucketAccessPolicy{
 			Prefix: prefix,
 			Policy: policy,
@@ -1111,7 +1159,7 @@ func (l *gcsGateway) SetBucketPolicy(ctx context.Context, bucket string, policyI
 	}
 
 	acl := l.client.Bucket(bucket).ACL()
-	if policies[0].Policy == policy.BucketPolicyNone {
+	if policies[0].Policy == miniogopolicy.BucketPolicyNone {
 		if err := acl.Delete(l.ctx, storage.AllUsers); err != nil {
 			logger.LogIf(ctx, err)
 			return gcsToObjectError(err, bucket)
@@ -1121,9 +1169,9 @@ func (l *gcsGateway) SetBucketPolicy(ctx context.Context, bucket string, policyI
 
 	var role storage.ACLRole
 	switch policies[0].Policy {
-	case policy.BucketPolicyReadOnly:
+	case miniogopolicy.BucketPolicyReadOnly:
 		role = storage.RoleReader
-	case policy.BucketPolicyWriteOnly:
+	case miniogopolicy.BucketPolicyWriteOnly:
 		role = storage.RoleWriter
 	default:
 		logger.LogIf(ctx, minio.NotImplemented{})
@@ -1139,30 +1187,63 @@ func (l *gcsGateway) SetBucketPolicy(ctx context.Context, bucket string, policyI
 }
 
 // GetBucketPolicy - Get policy on bucket
-func (l *gcsGateway) GetBucketPolicy(ctx context.Context, bucket string) (policy.BucketAccessPolicy, error) {
+func (l *gcsGateway) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Policy, error) {
 	rules, err := l.client.Bucket(bucket).ACL().List(l.ctx)
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return policy.BucketAccessPolicy{}, gcsToObjectError(err, bucket)
+		return nil, gcsToObjectError(err, bucket)
 	}
-	policyInfo := policy.BucketAccessPolicy{Version: "2012-10-17"}
+
+	var readOnly, writeOnly bool
 	for _, r := range rules {
 		if r.Entity != storage.AllUsers || r.Role == storage.RoleOwner {
 			continue
 		}
+
 		switch r.Role {
 		case storage.RoleReader:
-			policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyReadOnly, bucket, "")
+			readOnly = true
 		case storage.RoleWriter:
-			policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyWriteOnly, bucket, "")
+			writeOnly = true
 		}
 	}
-	// Return NoSuchBucketPolicy error, when policy is not set
-	if len(policyInfo.Statements) == 0 {
-		logger.LogIf(ctx, minio.PolicyNotFound{})
-		return policy.BucketAccessPolicy{}, gcsToObjectError(minio.PolicyNotFound{}, bucket)
+
+	actionSet := policy.NewActionSet()
+	if readOnly {
+		actionSet.Add(policy.GetBucketLocationAction)
+		actionSet.Add(policy.ListBucketAction)
+		actionSet.Add(policy.GetObjectAction)
 	}
-	return policyInfo, nil
+	if writeOnly {
+		actionSet.Add(policy.GetBucketLocationAction)
+		actionSet.Add(policy.ListBucketMultipartUploadsAction)
+		actionSet.Add(policy.AbortMultipartUploadAction)
+		actionSet.Add(policy.DeleteObjectAction)
+		actionSet.Add(policy.ListMultipartUploadPartsAction)
+		actionSet.Add(policy.PutObjectAction)
+	}
+
+	// Return NoSuchBucketPolicy error, when policy is not set
+	if len(actionSet) == 0 {
+		logger.LogIf(ctx, minio.BucketPolicyNotFound{})
+		return nil, gcsToObjectError(minio.BucketPolicyNotFound{}, bucket)
+	}
+
+	return &policy.Policy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.Statement{
+			policy.NewStatement(
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				actionSet,
+				policy.NewResourceSet(
+					policy.NewResource(bucket, ""),
+					policy.NewResource(bucket, "*"),
+				),
+				condition.NewFunctions(),
+			),
+		},
+	}, nil
 }
 
 // DeleteBucketPolicy - Delete all policies on bucket

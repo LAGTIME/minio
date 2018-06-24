@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/pkg/set"
+	"github.com/minio/minio/pkg/certs"
 )
 
 const (
@@ -38,10 +39,10 @@ const (
 	DefaultTCPKeepAliveTimeout = 10 * time.Second
 
 	// DefaultReadTimeout - default timout to read data from accepted connection.
-	DefaultReadTimeout = 30 * time.Second
+	DefaultReadTimeout = 5 * time.Minute
 
 	// DefaultWriteTimeout - default timout to write data to accepted connection.
-	DefaultWriteTimeout = 30 * time.Second
+	DefaultWriteTimeout = 5 * time.Minute
 
 	// DefaultMaxHeaderBytes - default maximum HTTP header size in bytes.
 	DefaultMaxHeaderBytes = 1 * humanize.MiByte
@@ -172,17 +173,22 @@ var defaultCipherSuites = []uint16{
 	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 }
 
+// Go only provides constant-time implementations of Curve25519 and NIST P-256 curve.
+var secureCurves = []tls.CurveID{tls.X25519, tls.CurveP256}
+
 // NewServer - creates new HTTP server using given arguments.
-func NewServer(addrs []string, handler http.Handler, certificate *tls.Certificate) *Server {
+func NewServer(addrs []string, handler http.Handler, getCert certs.GetCertificateFunc) *Server {
 	var tlsConfig *tls.Config
-	if certificate != nil {
+	if getCert != nil {
 		tlsConfig = &tls.Config{
+			// TLS hardening
 			PreferServerCipherSuites: true,
 			CipherSuites:             defaultCipherSuites,
+			CurvePreferences:         secureCurves,
 			MinVersion:               tls.VersionTLS12,
 			NextProtos:               []string{"http/1.1", "h2"},
 		}
-		tlsConfig.Certificates = append(tlsConfig.Certificates, *certificate)
+		tlsConfig.GetCertificate = getCert
 	}
 
 	httpServer := &Server{

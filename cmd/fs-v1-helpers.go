@@ -42,14 +42,13 @@ func fsRemoveFile(ctx context.Context, filePath string) (err error) {
 	}
 
 	if err = os.Remove((filePath)); err != nil {
-		fsErr := osErrToFSFileErr(err)
-		if fsErr != errFileNotFound {
+		err = osErrToFSFileErr(err)
+		if err != errFileNotFound {
 			logger.LogIf(ctx, err)
 		}
-		return fsErr
 	}
 
-	return nil
+	return err
 }
 
 // Removes all files and folders at a given path, handles
@@ -95,10 +94,8 @@ func fsRemoveDir(ctx context.Context, dirPath string) (err error) {
 
 	if err = os.Remove((dirPath)); err != nil {
 		if os.IsNotExist(err) {
-			logger.LogIf(ctx, errVolumeNotFound)
 			return errVolumeNotFound
 		} else if isSysErrNotEmpty(err) {
-			logger.LogIf(ctx, errVolumeNotEmpty)
 			return errVolumeNotEmpty
 		}
 		logger.LogIf(ctx, err)
@@ -125,7 +122,6 @@ func fsMkdir(ctx context.Context, dirPath string) (err error) {
 
 	if err = os.Mkdir((dirPath), 0777); err != nil {
 		if os.IsExist(err) {
-			logger.LogIf(ctx, errVolumeExists)
 			return errVolumeExists
 		} else if os.IsPermission(err) {
 			logger.LogIf(ctx, errDiskAccessDenied)
@@ -161,9 +157,8 @@ func fsStat(ctx context.Context, statLoc string) (os.FileInfo, error) {
 		logger.LogIf(ctx, err)
 		return nil, err
 	}
-	fi, err := os.Stat((statLoc))
+	fi, err := os.Stat(statLoc)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		return nil, err
 	}
 
@@ -183,7 +178,6 @@ func fsStatVolume(ctx context.Context, volume string) (os.FileInfo, error) {
 	}
 
 	if !fi.IsDir() {
-		logger.LogIf(ctx, errVolumeAccessDenied)
 		return nil, errVolumeAccessDenied
 	}
 
@@ -217,25 +211,52 @@ func osErrToFSFileErr(err error) error {
 func fsStatDir(ctx context.Context, statDir string) (os.FileInfo, error) {
 	fi, err := fsStat(ctx, statDir)
 	if err != nil {
-		return nil, osErrToFSFileErr(err)
+		err = osErrToFSFileErr(err)
+		if err != errFileNotFound {
+			logger.LogIf(ctx, err)
+		}
+		return nil, err
 	}
 	if !fi.IsDir() {
+		logger.LogIf(ctx, errFileAccessDenied)
 		return nil, errFileAccessDenied
 	}
 	return fi, nil
+}
+
+// Returns if the dirPath is a directory.
+func fsIsDir(ctx context.Context, dirPath string) bool {
+	fi, err := fsStat(ctx, dirPath)
+	if err != nil {
+		return false
+	}
+	return fi.IsDir()
 }
 
 // Lookup if file exists, returns file attributes upon success.
 func fsStatFile(ctx context.Context, statFile string) (os.FileInfo, error) {
 	fi, err := fsStat(ctx, statFile)
 	if err != nil {
-		return nil, osErrToFSFileErr(err)
+		err = osErrToFSFileErr(err)
+		if err != errFileNotFound {
+			logger.LogIf(ctx, err)
+		}
+		return nil, err
 	}
 	if fi.IsDir() {
 		logger.LogIf(ctx, errFileAccessDenied)
 		return nil, errFileAccessDenied
 	}
 	return fi, nil
+}
+
+// Returns if the filePath is a regular file.
+func fsIsFile(ctx context.Context, filePath string) bool {
+	fi, err := fsStat(ctx, filePath)
+	if err != nil {
+		return false
+	}
+	return fi.Mode().IsRegular()
 }
 
 // Opens the file at given path, optionally from an offset. Upon success returns
@@ -250,15 +271,18 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 		return nil, 0, err
 	}
 
-	fr, err := os.Open((readPath))
+	fr, err := os.Open(readPath)
 	if err != nil {
 		return nil, 0, osErrToFSFileErr(err)
 	}
 
 	// Stat to get the size of the file at path.
-	st, err := os.Stat((readPath))
+	st, err := os.Stat(readPath)
 	if err != nil {
-		logger.LogIf(ctx, err)
+		err = osErrToFSFileErr(err)
+		if err != errFileNotFound {
+			logger.LogIf(ctx, err)
+		}
 		return nil, 0, err
 	}
 
@@ -395,7 +419,9 @@ func fsDeleteFile(ctx context.Context, basePath, deletePath string) error {
 	}
 
 	if err := deleteFile(basePath, deletePath); err != nil {
-		logger.LogIf(ctx, err)
+		if err != errFileNotFound {
+			logger.LogIf(ctx, err)
+		}
 		return err
 	}
 	return nil

@@ -85,7 +85,7 @@ func dirObjectInfo(bucket, object string, size int64, metadata map[string]string
 
 func deleteBucketMetadata(ctx context.Context, bucket string, objAPI ObjectLayer) {
 	// Delete bucket access policy, if present - ignore any errors.
-	removeBucketPolicy(ctx, bucket, objAPI)
+	removePolicyConfig(ctx, objAPI, bucket)
 
 	// Delete notification config, if present - ignore any errors.
 	removeNotificationConfig(ctx, objAPI, bucket)
@@ -116,7 +116,7 @@ func cleanupDir(ctx context.Context, storage StorageAPI, volume, dirPath string)
 		}
 
 		// If it's a directory, list and call delFunc() for each entry.
-		entries, err := storage.ListDir(volume, entryPath)
+		entries, err := storage.ListDir(volume, entryPath, -1)
 		// If entryPath prefix never existed, safe to ignore.
 		if err == errFileNotFound {
 			return nil

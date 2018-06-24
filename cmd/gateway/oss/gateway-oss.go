@@ -30,11 +30,13 @@ import (
 	"github.com/dustin/go-humanize"
 
 	"github.com/minio/cli"
-	"github.com/minio/minio-go/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/pkg/policy"
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/policy/condition"
 )
 
 const (
@@ -65,9 +67,6 @@ ENVIRONMENT VARIABLES:
   BROWSER:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
-  UPDATE:
-     MINIO_UPDATE: To turn off in-place upgrades, set this value to "off".
-
   DOMAIN:
      MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
 	
@@ -78,22 +77,22 @@ ENVIRONMENT VARIABLES:
 
 EXAMPLES:
   1. Start minio gateway server for Aliyun OSS backend.
-      $ export MINIO_ACCESS_KEY=accesskey
-      $ export MINIO_SECRET_KEY=secretkey
-      $ {{.HelpName}}
+     $ export MINIO_ACCESS_KEY=accesskey
+     $ export MINIO_SECRET_KEY=secretkey
+     $ {{.HelpName}}
 
   2. Start minio gateway server for Aliyun OSS backend on custom endpoint.
-      $ export MINIO_ACCESS_KEY=Q3AM3UQ867SPQQA43P2F
-      $ export MINIO_SECRET_KEY=zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG
-      $ {{.HelpName}} https://oss.example.com
+     $ export MINIO_ACCESS_KEY=Q3AM3UQ867SPQQA43P2F
+     $ export MINIO_SECRET_KEY=zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG
+     $ {{.HelpName}} https://oss.example.com
 
   3. Start minio gateway server for Aliyun OSS backend with edge caching enabled.
-      $ export MINIO_ACCESS_KEY=accesskey
-      $ export MINIO_SECRET_KEY=secretkey
-      $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
-      $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
-      $ export MINIO_CACHE_EXPIRY=40
-      $ {{.HelpName}}
+     $ export MINIO_ACCESS_KEY=accesskey
+     $ export MINIO_SECRET_KEY=secretkey
+     $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
+     $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
+     $ export MINIO_CACHE_EXPIRY=40
+     $ {{.HelpName}}
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
@@ -368,11 +367,6 @@ func (l *ossObjects) MakeBucketWithLocation(ctx context.Context, bucket, locatio
 
 // ossGeBucketInfo gets bucket metadata.
 func ossGeBucketInfo(ctx context.Context, client *oss.Client, bucket string) (bi minio.BucketInfo, err error) {
-	if !ossIsValidBucketName(bucket) {
-		logger.LogIf(ctx, minio.BucketNameInvalid{Bucket: bucket})
-		return bi, minio.BucketNameInvalid{Bucket: bucket}
-	}
-
 	bgir, err := client.GetBucketInfo(bucket)
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -967,8 +961,14 @@ func (l *ossObjects) CompleteMultipartUpload(ctx context.Context, bucket, object
 // oss.ACLPublicReadWrite: readwrite in minio terminology
 // oss.ACLPublicRead: readonly in minio terminology
 // oss.ACLPrivate: none in minio terminology
-func (l *ossObjects) SetBucketPolicy(ctx context.Context, bucket string, policyInfo policy.BucketAccessPolicy) error {
-	bucketPolicies := policy.GetPolicies(policyInfo.Statements, bucket, "")
+func (l *ossObjects) SetBucketPolicy(ctx context.Context, bucket string, bucketPolicy *policy.Policy) error {
+	policyInfo, err := minio.PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		return ossToObjectError(err, bucket)
+	}
+
+	bucketPolicies := miniogopolicy.GetPolicies(policyInfo.Statements, bucket, "")
 	if len(bucketPolicies) != 1 {
 		logger.LogIf(ctx, minio.NotImplemented{})
 		return minio.NotImplemented{}
@@ -983,11 +983,11 @@ func (l *ossObjects) SetBucketPolicy(ctx context.Context, bucket string, policyI
 
 		var acl oss.ACLType
 		switch bucketPolicy {
-		case policy.BucketPolicyNone:
+		case miniogopolicy.BucketPolicyNone:
 			acl = oss.ACLPrivate
-		case policy.BucketPolicyReadOnly:
+		case miniogopolicy.BucketPolicyReadOnly:
 			acl = oss.ACLPublicRead
-		case policy.BucketPolicyReadWrite:
+		case miniogopolicy.BucketPolicyReadWrite:
 			acl = oss.ACLPublicReadWrite
 		default:
 			logger.LogIf(ctx, minio.NotImplemented{})
@@ -1005,29 +1005,60 @@ func (l *ossObjects) SetBucketPolicy(ctx context.Context, bucket string, policyI
 }
 
 // GetBucketPolicy will get policy on bucket.
-func (l *ossObjects) GetBucketPolicy(ctx context.Context, bucket string) (policy.BucketAccessPolicy, error) {
+func (l *ossObjects) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Policy, error) {
 	result, err := l.Client.GetBucketACL(bucket)
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return policy.BucketAccessPolicy{}, ossToObjectError(err)
+		return nil, ossToObjectError(err)
 	}
 
-	policyInfo := policy.BucketAccessPolicy{Version: "2012-10-17"}
+	var readOnly, readWrite bool
 	switch result.ACL {
 	case string(oss.ACLPrivate):
 		// By default, all buckets starts with a "private" policy.
-		logger.LogIf(ctx, minio.PolicyNotFound{})
-		return policy.BucketAccessPolicy{}, ossToObjectError(minio.PolicyNotFound{}, bucket)
+		logger.LogIf(ctx, minio.BucketPolicyNotFound{})
+		return nil, ossToObjectError(minio.BucketPolicyNotFound{}, bucket)
 	case string(oss.ACLPublicRead):
-		policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyReadOnly, bucket, "")
+		readOnly = true
 	case string(oss.ACLPublicReadWrite):
-		policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyReadWrite, bucket, "")
+		readWrite = true
 	default:
 		logger.LogIf(ctx, minio.NotImplemented{})
-		return policy.BucketAccessPolicy{}, minio.NotImplemented{}
+		return nil, minio.NotImplemented{}
 	}
 
-	return policyInfo, nil
+	actionSet := policy.NewActionSet()
+	if readOnly {
+		actionSet.Add(policy.GetBucketLocationAction)
+		actionSet.Add(policy.ListBucketAction)
+		actionSet.Add(policy.GetObjectAction)
+	}
+	if readWrite {
+		actionSet.Add(policy.GetBucketLocationAction)
+		actionSet.Add(policy.ListBucketAction)
+		actionSet.Add(policy.GetObjectAction)
+		actionSet.Add(policy.ListBucketMultipartUploadsAction)
+		actionSet.Add(policy.AbortMultipartUploadAction)
+		actionSet.Add(policy.DeleteObjectAction)
+		actionSet.Add(policy.ListMultipartUploadPartsAction)
+		actionSet.Add(policy.PutObjectAction)
+	}
+
+	return &policy.Policy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.Statement{
+			policy.NewStatement(
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				actionSet,
+				policy.NewResourceSet(
+					policy.NewResource(bucket, ""),
+					policy.NewResource(bucket, "*"),
+				),
+				condition.NewFunctions(),
+			),
+		},
+	}, nil
 }
 
 // DeleteBucketPolicy deletes all policies on bucket.

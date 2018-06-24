@@ -27,6 +27,7 @@ import (
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/event/target"
 	xnet "github.com/minio/minio/pkg/net"
+	"github.com/minio/minio/pkg/policy"
 )
 
 const (
@@ -43,6 +44,9 @@ var errNoSuchNotifications = errors.New("The specified bucket does not have buck
 func (api objectAPIHandlers) GetBucketNotificationHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, "GetBucketNotification")
 
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {
 		writeErrorResponse(w, ErrServerNotInitialized, r.URL)
@@ -53,13 +57,11 @@ func (api objectAPIHandlers) GetBucketNotificationHandler(w http.ResponseWriter,
 		writeErrorResponse(w, ErrNotImplemented, r.URL)
 		return
 	}
-	if s3Error := checkRequestAuthType(ctx, r, "", "", globalServerConfig.GetRegion()); s3Error != ErrNone {
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
 		writeErrorResponse(w, s3Error, r.URL)
 		return
 	}
-
-	vars := mux.Vars(r)
-	bucketName := vars["bucket"]
 
 	_, err := objAPI.GetBucketInfo(ctx, bucketName)
 	if err != nil {
@@ -104,13 +106,14 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		writeErrorResponse(w, ErrNotImplemented, r.URL)
 		return
 	}
-	if s3Error := checkRequestAuthType(ctx, r, "", "", globalServerConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, s3Error, r.URL)
-		return
-	}
 
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL)
+		return
+	}
 
 	_, err := objectAPI.GetBucketInfo(ctx, bucketName)
 	if err != nil {
@@ -143,9 +146,9 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 
 	rulesMap := config.ToRulesMap()
 	globalNotificationSys.AddRulesMap(bucketName, rulesMap)
-	for addr, err := range globalNotificationSys.PutBucketNotification(bucketName, rulesMap) {
-		logger.GetReqInfo(ctx).AppendTags("remotePeer", addr.Name)
-		logger.LogIf(ctx, err)
+	for nerr := range globalNotificationSys.PutBucketNotification(bucketName, rulesMap) {
+		logger.GetReqInfo(ctx).AppendTags("remotePeer", nerr.Host.Name)
+		logger.LogIf(ctx, nerr.Err)
 	}
 
 	writeSuccessResponseHeadersOnly(w)
@@ -166,13 +169,14 @@ func (api objectAPIHandlers) ListenBucketNotificationHandler(w http.ResponseWrit
 		writeErrorResponse(w, ErrNotImplemented, r.URL)
 		return
 	}
-	if s3Error := checkRequestAuthType(ctx, r, "", "", globalServerConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, s3Error, r.URL)
-		return
-	}
 
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListenBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL)
+		return
+	}
 
 	values := r.URL.Query()
 
@@ -220,8 +224,18 @@ func (api objectAPIHandlers) ListenBucketNotificationHandler(w http.ResponseWrit
 		return
 	}
 
-	host := xnet.MustParseHost(r.RemoteAddr)
-	target := target.NewHTTPClientTarget(*host, w)
+	host, err := xnet.ParseHost(r.RemoteAddr)
+	if err != nil {
+		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+		return
+	}
+
+	target, err := target.NewHTTPClientTarget(*host, w)
+	if err != nil {
+		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+		return
+	}
+
 	rulesMap := event.NewRulesMap(eventNames, pattern, target.ID())
 
 	if err := globalNotificationSys.AddRemoteTarget(bucketName, target, rulesMap); err != nil {
@@ -233,23 +247,28 @@ func (api objectAPIHandlers) ListenBucketNotificationHandler(w http.ResponseWrit
 	defer globalNotificationSys.RemoveRemoteTarget(bucketName, target.ID())
 	defer globalNotificationSys.RemoveRulesMap(bucketName, rulesMap)
 
-	thisAddr := xnet.MustParseHost(GetLocalPeer(globalEndpoints))
-	if err := SaveListener(objAPI, bucketName, eventNames, pattern, target.ID(), *thisAddr); err != nil {
+	thisAddr, err := xnet.ParseHost(GetLocalPeer(globalEndpoints))
+	if err != nil {
+		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
+		return
+	}
+
+	if err = SaveListener(objAPI, bucketName, eventNames, pattern, target.ID(), *thisAddr); err != nil {
 		logger.GetReqInfo(ctx).AppendTags("target", target.ID().Name)
 		logger.LogIf(ctx, err)
 		writeErrorResponse(w, toAPIErrorCode(err), r.URL)
 		return
 	}
 
-	errors := globalNotificationSys.ListenBucketNotification(bucketName, eventNames, pattern, target.ID(), *thisAddr)
-	for addr, err := range errors {
-		logger.GetReqInfo(ctx).AppendTags("remotePeer", addr.Name)
-		logger.LogIf(ctx, err)
+	errCh := globalNotificationSys.ListenBucketNotification(bucketName, eventNames, pattern, target.ID(), *thisAddr)
+	for nerr := range errCh {
+		logger.GetReqInfo(ctx).AppendTags("remotePeer", nerr.Host.Name)
+		logger.LogIf(ctx, nerr.Err)
 	}
 
 	<-target.DoneCh
 
-	if err := RemoveListener(objAPI, bucketName, target.ID(), *thisAddr); err != nil {
+	if err = RemoveListener(objAPI, bucketName, target.ID(), *thisAddr); err != nil {
 		logger.GetReqInfo(ctx).AppendTags("target", target.ID().Name)
 		logger.LogIf(ctx, err)
 		writeErrorResponse(w, toAPIErrorCode(err), r.URL)

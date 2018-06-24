@@ -66,7 +66,9 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 func reduceQuorumErrs(ctx context.Context, errs []error, ignoredErrs []error, quorum int, quorumErr error) error {
 	maxCount, maxErr := reduceErrs(errs, ignoredErrs)
 	if maxCount >= quorum {
-		logger.LogIf(ctx, maxErr)
+		if maxErr != errFileNotFound && maxErr != errVolumeNotFound {
+			logger.LogIf(ctx, maxErr)
+		}
 		return maxErr
 	}
 	logger.LogIf(ctx, quorumErr)
@@ -295,7 +297,9 @@ func readXLMeta(ctx context.Context, disk StorageAPI, bucket string, object stri
 	// Reads entire `xl.json`.
 	xlMetaBuf, err := disk.ReadAll(bucket, path.Join(object, xlMetaJSONFile))
 	if err != nil {
-		logger.LogIf(ctx, err)
+		if err != errFileNotFound {
+			logger.LogIf(ctx, err)
+		}
 		return xlMetaV1{}, err
 	}
 	// obtain xlMetaV1{} using `github.com/tidwall/gjson`.
@@ -367,17 +371,6 @@ func shuffleDisks(disks []StorageAPI, distribution []int) (shuffledDisks []Stora
 		shuffledDisks[blockIndex-1] = disks[index]
 	}
 	return shuffledDisks
-}
-
-// unshuffleIndex - performs reverse of the shuffleDisks operations
-// for a single 0-based index.
-func unshuffleIndex(n int, distribution []int) int {
-	for i, v := range distribution {
-		if v-1 == n {
-			return i
-		}
-	}
-	return -1
 }
 
 // evalDisks - returns a new slice of disks where nil is set if

@@ -154,6 +154,7 @@ func FromMinioClientObjectInfo(bucket string, oi minio.ObjectInfo) ObjectInfo {
 		UserDefined:     userDefined,
 		ContentType:     oi.ContentType,
 		ContentEncoding: oi.Metadata.Get("Content-Encoding"),
+		StorageClass:    oi.StorageClass,
 	}
 }
 
@@ -281,7 +282,7 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	case "BucketNotEmpty":
 		err = BucketNotEmpty{}
 	case "NoSuchBucketPolicy":
-		err = PolicyNotFound{}
+		err = BucketPolicyNotFound{}
 	case "InvalidBucketName":
 		err = BucketNameInvalid{Bucket: bucket}
 	case "NoSuchBucket":

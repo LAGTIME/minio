@@ -17,16 +17,23 @@
 package cmd
 
 import (
+	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	etcd "github.com/coreos/etcd/client"
+
 	"github.com/minio/cli"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/dns"
+
+	"github.com/minio/minio-go/pkg/set"
 )
 
 // Check for updates and print a notification message
@@ -41,13 +48,33 @@ func checkUpdate(mode string) {
 	}
 }
 
+// Initialize and load config from remote etcd or local config directory
 func initConfig() {
-	// Config file does not exist, we create it fresh and return upon success.
+	if globalEtcdClient != nil {
+		kapi := etcd.NewKeysAPI(globalEtcdClient)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, err := kapi.Get(ctx, getConfigFile(), nil)
+		cancel()
+		if err == nil {
+			logger.FatalIf(migrateConfig(), "Config migration failed.")
+			logger.FatalIf(loadConfig(), "Unable to load config version: '%s'.", serverConfigVersion)
+		} else {
+			if etcd.IsKeyNotFound(err) {
+				logger.FatalIf(newConfig(), "Unable to initialize minio config for the first time.")
+				logger.Info("Created minio configuration file successfully at %v", globalEtcdClient.Endpoints())
+			} else {
+				logger.FatalIf(err, "Unable to load config version: '%s'.", serverConfigVersion)
+			}
+		}
+		return
+	}
+
 	if isFile(getConfigFile()) {
-		logger.FatalIf(migrateConfig(), "Config migration failed.")
-		logger.FatalIf(loadConfig(), "Unable to load config version: '%s'.", serverConfigVersion)
+		logger.FatalIf(migrateConfig(), "Config migration failed")
+		logger.FatalIf(loadConfig(), "Unable to load the configuration file")
 	} else {
-		logger.FatalIf(newConfig(), "Unable to initialize minio config for the first time.")
+		// Config file does not exist, we create it fresh and return upon success.
+		logger.FatalIf(newConfig(), "Unable to initialize minio config for the first time")
 		logger.Info("Created minio configuration file successfully at " + getConfigDir())
 	}
 }
@@ -71,12 +98,12 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 		// default config directory.
 		configDir = getConfigDir()
 		if configDir == "" {
-			logger.FatalIf(errors.New("missing option"), "config-dir option must be provided.")
+			logger.FatalIf(errors.New("missing option"), "config-dir option must be provided")
 		}
 	}
 
 	if configDir == "" {
-		logger.FatalIf(errors.New("empty directory"), "Configuration directory cannot be empty.")
+		logger.FatalIf(errors.New("empty directory"), "Configuration directory cannot be empty")
 	}
 
 	// Disallow relative paths, figure out absolute paths.
@@ -95,7 +122,9 @@ func handleCommonEnvVars() {
 	secretKey := os.Getenv("MINIO_SECRET_KEY")
 	if accessKey != "" && secretKey != "" {
 		cred, err := auth.CreateCredentials(accessKey, secretKey)
-		logger.FatalIf(err, "Invalid access/secret Key set in environment.")
+		if err != nil {
+			logger.Fatal(uiErrInvalidCredentials(err), "Unable to validate credentials inherited from the shell environment")
+		}
 
 		// credential Envs are set globally.
 		globalIsEnvCreds = true
@@ -103,9 +132,9 @@ func handleCommonEnvVars() {
 	}
 
 	if browser := os.Getenv("MINIO_BROWSER"); browser != "" {
-		browserFlag, err := ParseBrowserFlag(browser)
+		browserFlag, err := ParseBoolFlag(browser)
 		if err != nil {
-			logger.FatalIf(errors.New("invalid value"), "Unknown value ‘%s’ in MINIO_BROWSER environment variable.", browser)
+			logger.Fatal(uiErrInvalidBrowserValue(nil).Msg("Unknown value `%s`", browser), "Unable to validate MINIO_BROWSER environment variable")
 		}
 
 		// browser Envs are set globally, this does not represent
@@ -121,25 +150,58 @@ func handleCommonEnvVars() {
 		logger.FatalIf(err, "error opening file %s", traceFile)
 	}
 
-	globalDomainName = os.Getenv("MINIO_DOMAIN")
-	if globalDomainName != "" {
-		globalIsEnvDomainName = true
+	etcdEndpointsEnv, ok := os.LookupEnv("MINIO_ETCD_ENDPOINTS")
+	if ok {
+		etcdEndpoints := strings.Split(etcdEndpointsEnv, ",")
+		var err error
+		globalEtcdClient, err = etcd.New(etcd.Config{
+			Endpoints: etcdEndpoints,
+			Transport: NewCustomHTTPTransport(),
+		})
+		logger.FatalIf(err, "Unable to initialize etcd with %s", etcdEndpoints)
+	}
+
+	globalDomainName, globalIsEnvDomainName = os.LookupEnv("MINIO_DOMAIN")
+
+	minioEndpointsEnv, ok := os.LookupEnv("MINIO_PUBLIC_IPS")
+	if ok {
+		minioEndpoints := strings.Split(minioEndpointsEnv, ",")
+		globalDomainIPs = set.NewStringSet()
+		for i, ip := range minioEndpoints {
+			if net.ParseIP(ip) == nil {
+				logger.FatalIf(errInvalidArgument, "Unable to initialize Minio server with invalid MINIO_PUBLIC_IPS[%d]: %s", i, ip)
+			}
+			globalDomainIPs.Add(ip)
+		}
+	}
+	if globalDomainName != "" && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
+		var err error
+		globalDNSConfig, err = dns.NewCoreDNS(globalDomainName, globalDomainIPs, globalMinioPort, globalEtcdClient)
+		logger.FatalIf(err, "Unable to initialize DNS config for %s.", globalDomainName)
 	}
 
 	if drives := os.Getenv("MINIO_CACHE_DRIVES"); drives != "" {
 		driveList, err := parseCacheDrives(strings.Split(drives, cacheEnvDelimiter))
-		logger.FatalIf(err, "Invalid value set in environment variable MINIO_CACHE_DRIVES %s.", drives)
+		if err != nil {
+			logger.Fatal(err, "Unable to parse MINIO_CACHE_DRIVES value (%s)", drives)
+		}
 		globalCacheDrives = driveList
 		globalIsDiskCacheEnabled = true
 	}
+
 	if excludes := os.Getenv("MINIO_CACHE_EXCLUDE"); excludes != "" {
 		excludeList, err := parseCacheExcludes(strings.Split(excludes, cacheEnvDelimiter))
-		logger.FatalIf(err, "Invalid value set in environment variable MINIO_CACHE_EXCLUDE %s.", excludes)
+		if err != nil {
+			logger.Fatal(err, "Unable to parse MINIO_CACHE_EXCLUDE value (`%s`)", excludes)
+		}
 		globalCacheExcludes = excludeList
 	}
+
 	if expiryStr := os.Getenv("MINIO_CACHE_EXPIRY"); expiryStr != "" {
 		expiry, err := strconv.Atoi(expiryStr)
-		logger.FatalIf(err, "Invalid value set in environment variable MINIO_CACHE_EXPIRY %s.", expiryStr)
+		if err != nil {
+			logger.Fatal(uiErrInvalidCacheExpiryValue(err), "Unable to parse MINIO_CACHE_EXPIRY value (`%s`)", expiryStr)
+		}
 		globalCacheExpiry = expiry
 	}
 
@@ -155,29 +217,39 @@ func handleCommonEnvVars() {
 		// Check for environment variables and parse into storageClass struct
 		if ssc := os.Getenv(standardStorageClassEnv); ssc != "" {
 			globalStandardStorageClass, err = parseStorageClass(ssc)
-			logger.FatalIf(err, "Invalid value set in environment variable %s.", standardStorageClassEnv)
+			logger.FatalIf(err, "Invalid value set in environment variable %s", standardStorageClassEnv)
 		}
 
 		if rrsc := os.Getenv(reducedRedundancyStorageClassEnv); rrsc != "" {
 			globalRRStorageClass, err = parseStorageClass(rrsc)
-			logger.FatalIf(err, "Invalid value set in environment variable %s.", reducedRedundancyStorageClassEnv)
+			logger.FatalIf(err, "Invalid value set in environment variable %s", reducedRedundancyStorageClassEnv)
 		}
 
 		// Validation is done after parsing both the storage classes. This is needed because we need one
 		// storage class value to deduce the correct value of the other storage class.
 		if globalRRStorageClass.Scheme != "" {
 			err = validateParity(globalStandardStorageClass.Parity, globalRRStorageClass.Parity)
-			logger.FatalIf(err, "Invalid value set in environment variable %s.", reducedRedundancyStorageClassEnv)
+			logger.FatalIf(err, "Invalid value set in environment variable %s", reducedRedundancyStorageClassEnv)
 			globalIsStorageClass = true
 		}
 
 		if globalStandardStorageClass.Scheme != "" {
 			err = validateParity(globalStandardStorageClass.Parity, globalRRStorageClass.Parity)
-			logger.FatalIf(err, "Invalid value set in environment variable %s.", standardStorageClassEnv)
+			logger.FatalIf(err, "Invalid value set in environment variable %s", standardStorageClassEnv)
 			globalIsStorageClass = true
 		}
 	}
 
 	// Get WORM environment variable.
-	globalWORMEnabled = strings.EqualFold(os.Getenv("MINIO_WORM"), "on")
+	if worm := os.Getenv("MINIO_WORM"); worm != "" {
+		wormFlag, err := ParseBoolFlag(worm)
+		if err != nil {
+			logger.Fatal(uiErrInvalidWormValue(nil).Msg("Unknown value `%s`", worm), "Unable to validate MINIO_WORM environment variable")
+		}
+
+		// worm Envs are set globally, this does not represent
+		// if worm is turned off or on.
+		globalIsEnvWORM = true
+		globalWORMEnabled = bool(wormFlag)
+	}
 }

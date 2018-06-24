@@ -52,13 +52,14 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	router "github.com/gorilla/mux"
-	"github.com/minio/minio-go/pkg/policy"
+	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/pkg/s3signer"
+	"github.com/minio/minio-go/pkg/s3utils"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/bpool"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
 )
 
 // Tests should initNSLock only once.
@@ -75,7 +76,7 @@ func init() {
 	// Set system resources to maximum.
 	setMaxResources()
 
-	logger.EnableQuiet()
+	logger.Disable = true
 }
 
 // concurreny level for certain parallel tests.
@@ -354,8 +355,11 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 	globalMinioAddr = getEndpointsLocalAddr(testServer.Disks)
 	globalNotificationSys, err = NewNotificationSys(globalServerConfig, testServer.Disks)
 	if err != nil {
-		t.Fatalf("Unable to initialize queue configuration")
+		t.Fatalf("Unable to create new notification system. %v", err)
 	}
+
+	// Create new policy system.
+	globalPolicySys = NewPolicySys()
 
 	return testServer
 }
@@ -398,7 +402,7 @@ func StartTestServer(t TestErrHandler, instanceType string) TestServer {
 // The object Layer will be a temp back used for testing purpose.
 func initTestStorageRPCEndPoint(endpoints EndpointList) http.Handler {
 	// Initialize router.
-	muxRouter := router.NewRouter().SkipClean(true)
+	muxRouter := mux.NewRouter().SkipClean(true)
 	registerStorageRPCRouters(muxRouter, endpoints)
 	return muxRouter
 }
@@ -469,16 +473,16 @@ func StartTestPeersRPCServer(t TestErrHandler, instanceType string) TestServer {
 	testRPCServer.Obj = objLayer
 	globalObjLayerMutex.Unlock()
 
-	mux := router.NewRouter().SkipClean(true)
+	router := mux.NewRouter().SkipClean(true)
 	// need storage layer for bucket config storage.
-	registerStorageRPCRouters(mux, endpoints)
+	registerStorageRPCRouters(router, endpoints)
 	// need API layer to send requests, etc.
-	registerAPIRouter(mux)
+	registerAPIRouter(router)
 	// module being tested is Peer RPCs router.
-	registerS3PeerRPCRouter(mux)
+	registerPeerRPCRouter(router)
 
 	// Run TestServer.
-	testRPCServer.Server = httptest.NewServer(mux)
+	testRPCServer.Server = httptest.NewServer(router)
 
 	// initialize remainder of serverCmdConfig
 	testRPCServer.endpoints = endpoints
@@ -601,7 +605,7 @@ func newTestConfig(bucketLocation string) (rootPath string, err error) {
 	globalServerConfig.SetRegion(bucketLocation)
 
 	// Save config.
-	if err = globalServerConfig.Save(); err != nil {
+	if err = globalServerConfig.Save(getConfigFile()); err != nil {
 		return "", err
 	}
 
@@ -746,7 +750,7 @@ func signStreamingRequest(req *http.Request, accessKey, secretKey string, currTi
 	req.URL.RawQuery = strings.Replace(req.URL.Query().Encode(), "+", "%20", -1)
 
 	// Get canonical URI.
-	canonicalURI := getURLEncodedName(req.URL.Path)
+	canonicalURI := s3utils.EncodePath(req.URL.Path)
 
 	// Get canonical request.
 	// canonicalRequest =
@@ -1101,7 +1105,7 @@ func signRequestV4(req *http.Request, accessKey, secretKey string) error {
 	req.URL.RawQuery = strings.Replace(req.URL.Query().Encode(), "+", "%20", -1)
 
 	// Get canonical URI.
-	canonicalURI := getURLEncodedName(req.URL.Path)
+	canonicalURI := s3utils.EncodePath(req.URL.Path)
 
 	// Get canonical request.
 	// canonicalRequest =
@@ -1155,6 +1159,11 @@ func signRequestV4(req *http.Request, accessKey, secretKey string) error {
 // getCredentialString generate a credential string.
 func getCredentialString(accessKeyID, location string, t time.Time) string {
 	return accessKeyID + "/" + getScope(t, location)
+}
+
+// getMD5HashBase64 returns MD5 hash in base64 encoding of given data.
+func getMD5HashBase64(data []byte) string {
+	return base64.StdEncoding.EncodeToString(getMD5Sum(data))
 }
 
 // Returns new HTTP request object.
@@ -1447,7 +1456,7 @@ func makeTestTargetURL(endPoint, bucketName, objectName string, queryValues url.
 		urlStr = urlStr + bucketName + "/"
 	}
 	if objectName != "" {
-		urlStr = urlStr + getURLEncodedName(objectName)
+		urlStr = urlStr + s3utils.EncodePath(objectName)
 	}
 	if len(queryValues) > 0 {
 		urlStr = urlStr + "?" + queryValues.Encode()
@@ -1710,16 +1719,13 @@ func newTestObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err erro
 		return xl.storageDisks
 	}
 
-	// Initialize and load bucket policies.
-	xl.bucketPolicies, err = initBucketPolicies(xl)
-	if err != nil {
-		return nil, err
-	}
-
-	// Initialize a new event notifier.
+	// Create new notification system.
 	if globalNotificationSys, err = NewNotificationSys(globalServerConfig, endpoints); err != nil {
 		return nil, err
 	}
+
+	// Create new policy system.
+	globalPolicySys = NewPolicySys()
 
 	return xl, nil
 }
@@ -1816,7 +1822,7 @@ func prepareTestBackend(instanceType string) (ObjectLayer, []string, error) {
 //   STEP 2: Set the policy to allow the unsigned request, use the policyFunc to obtain the relevant statement and call
 //           the handler again to verify its success.
 func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketName, objectName, instanceType string, apiRouter http.Handler,
-	anonReq *http.Request, policyFunc func(string, string) policy.Statement) {
+	anonReq *http.Request, bucketPolicy *policy.Policy) {
 
 	anonTestStr := "Anonymous HTTP request test"
 	unknownSignTestStr := "Unknown HTTP signature test"
@@ -1858,7 +1864,8 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 	// HEAD HTTTP request doesn't contain response body.
 	if anonReq.Method != "HEAD" {
 		// read the response body.
-		actualContent, err := ioutil.ReadAll(rec.Body)
+		var actualContent []byte
+		actualContent, err = ioutil.ReadAll(rec.Body)
 		if err != nil {
 			t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Failed parsing response body: <ERROR> %v", err)))
 		}
@@ -1867,13 +1874,13 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 			t.Fatal(failTestStr(anonTestStr, "error response content differs from expected value"))
 		}
 	}
-	// Set write only policy on bucket to allow anonymous HTTP request for the operation under test.
-	// request to go through.
-	bp := policy.BucketAccessPolicy{
-		Version:    "1.0",
-		Statements: []policy.Statement{policyFunc(bucketName, "")},
+
+	if err := obj.SetBucketPolicy(context.Background(), bucketName, bucketPolicy); err != nil {
+		t.Fatalf("unexpected error. %v", err)
 	}
-	obj.SetBucketPolicy(context.Background(), bucketName, bp)
+	globalPolicySys.Set(bucketName, *bucketPolicy)
+	defer globalPolicySys.Remove(bucketName)
+
 	// now call the handler again with the unsigned/anonymous request, it should be accepted.
 	rec = httptest.NewRecorder()
 
@@ -2125,7 +2132,7 @@ func ExecObjectLayerStaleFilesTest(t *testing.T, objTest objTestStaleFilesType) 
 	defer removeRoots(erasureDisks)
 }
 
-func registerBucketLevelFunc(bucket *router.Router, api objectAPIHandlers, apiFunctions ...string) {
+func registerBucketLevelFunc(bucket *mux.Router, api objectAPIHandlers, apiFunctions ...string) {
 	for _, apiFunction := range apiFunctions {
 		switch apiFunction {
 		case "PostPolicy":
@@ -2199,14 +2206,14 @@ func registerBucketLevelFunc(bucket *router.Router, api objectAPIHandlers, apiFu
 }
 
 // registerAPIFunctions helper function to add API functions identified by name to the routers.
-func registerAPIFunctions(muxRouter *router.Router, objLayer ObjectLayer, apiFunctions ...string) {
+func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFunctions ...string) {
 	if len(apiFunctions) == 0 {
 		// Register all api endpoints by default.
 		registerAPIRouter(muxRouter)
 		return
 	}
 	// API Router.
-	apiRouter := muxRouter.NewRoute().PathPrefix("/").Subrouter()
+	apiRouter := muxRouter.PathPrefix("/").Subrouter()
 	// Bucket router.
 	bucketRouter := apiRouter.PathPrefix("/{bucket}").Subrouter()
 
@@ -2236,7 +2243,7 @@ func registerAPIFunctions(muxRouter *router.Router, objLayer ObjectLayer, apiFun
 func initTestAPIEndPoints(objLayer ObjectLayer, apiFunctions []string) http.Handler {
 	// initialize a new mux router.
 	// goriilla/mux is the library used to register all the routes and handle them.
-	muxRouter := router.NewRouter().SkipClean(true)
+	muxRouter := mux.NewRouter().SkipClean(true)
 	if len(apiFunctions) > 0 {
 		// Iterate the list of API functions requested for and register them in mux HTTP handler.
 		registerAPIFunctions(muxRouter, objLayer, apiFunctions...)
@@ -2253,38 +2260,9 @@ func initTestWebRPCEndPoint(objLayer ObjectLayer) http.Handler {
 	globalObjLayerMutex.Unlock()
 
 	// Initialize router.
-	muxRouter := router.NewRouter().SkipClean(true)
+	muxRouter := mux.NewRouter().SkipClean(true)
 	registerWebRouter(muxRouter)
 	return muxRouter
-}
-
-// Initialize browser RPC endpoint.
-func initTestBrowserPeerRPCEndPoint() http.Handler {
-	// Initialize router.
-	muxRouter := router.NewRouter().SkipClean(true)
-	registerBrowserPeerRPCRouter(muxRouter)
-	return muxRouter
-}
-
-func StartTestBrowserPeerRPCServer(t TestErrHandler, instanceType string) TestServer {
-	root, err := newTestConfig(globalMinioDefaultRegion)
-	if err != nil {
-		t.Fatalf("%s", err)
-	}
-
-	// Create an instance of TestServer.
-	testRPCServer := TestServer{}
-
-	// Fetch credentials for the test server.
-	credentials := globalServerConfig.GetCredential()
-
-	testRPCServer.Root = root
-	testRPCServer.AccessKey = credentials.AccessKey
-	testRPCServer.SecretKey = credentials.SecretKey
-
-	// Initialize and run the TestServer.
-	testRPCServer.Server = httptest.NewServer(initTestBrowserPeerRPCEndPoint())
-	return testRPCServer
 }
 
 func StartTestS3PeerRPCServer(t TestErrHandler) (TestServer, []string) {
@@ -2315,11 +2293,8 @@ func StartTestS3PeerRPCServer(t TestErrHandler) (TestServer, []string) {
 	globalObjLayerMutex.Unlock()
 
 	// Register router on a new mux
-	muxRouter := router.NewRouter().SkipClean(true)
-	err = registerS3PeerRPCRouter(muxRouter)
-	if err != nil {
-		t.Fatalf("%s", err)
-	}
+	muxRouter := mux.NewRouter().SkipClean(true)
+	registerPeerRPCRouter(muxRouter)
 
 	// Initialize and run the TestServer.
 	testRPCServer.Server = httptest.NewServer(muxRouter)
